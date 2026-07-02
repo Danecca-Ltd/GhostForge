@@ -4,7 +4,7 @@
   "engine": "Python",
   "author": "Danecca / GhostForge",
   "description": "Drawing automation: Sketch Annotate, Dim Annotate, and DWG Probe — all in a dedicated GhostForge panel in the Drawing workspace.",
-  "version": "1.2.6",
+  "version": "1.2.8",
   "supportedOS": "windows|mac",
   "editEnabled": true
 }

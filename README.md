@@ -151,7 +151,7 @@ d4 = 3.000 mm  Feature
 | DWG Probe (entity database dump) | Working |
 | Dim Annotate — view geometry reading | Working |
 | Dim Annotate — layer creation | Working |
-| Dim Annotate — dimension placement (DIMLINEAR) | In progress — bare `command` fix deployed v1.2.6 |
+| Dim Annotate — dimension placement (DIMLINEAR) | Working (v1.2.8) |
 | Associative dimensions (linked to model geometry) | Blocked — Fusion selection loop not addressable |
 
 Open research: cursor simulation (SetCursorPos + click commands), FusionDoc.SelectObject handle format, April 2026 PMI API additions.

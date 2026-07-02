@@ -283,8 +283,8 @@ _LISP_DIM = r'''
                    ent data next_ent views front side lv
                    fx fy fscale fw fh sx sy sscale sw sh
                    f_left f_right f_top f_bot s_left s_right s_top
-                   dim_gap layout r1 r2 r3 orig_layer
-                   g40s g10s pair _style _layer _dbgf)
+                   dim_gap layout r1 r2 r3 orig_osmode
+                   g40s g10s pair _style _dbgf)
 
   ; ── Setup ──────────────────────────────────────────────────────────────
   ; NOTE: (getvar "CTAB") and (getvar "DIMSTYLE") return boolean T in
@@ -311,10 +311,8 @@ _LISP_DIM = r'''
   ;       All alist walks use while/cdr instead.
 
   (defun _mkdim (val ex1 ey1 ex2 ey2 dpx dpy tpx tpy rot)
-    ; No groups 67/410 — CVPORT=1 TILEMODE=0 already means paper space.
-    ; group 3 (DIMSTYLE name) = "" → use current style; avoids tblsearch.
     (entmake
-      (list (cons 0 "DIMENSION") (cons 8 _layer)
+      (list (cons 0 "DIMENSION") (cons 8 "0")
             (cons 70 32)
             (cons 10 (list dpx dpy 0.0)) (cons 11 (list tpx tpy 0.0))
             (cons 12 (list 0.0 0.0 0.0)) (cons 1 "") (cons 71 5)
@@ -326,40 +324,6 @@ _LISP_DIM = r'''
             (cons 15 (list 0.0 0.0 0.0)) (cons 16 (list 0.0 0.0 0.0))
             (cons 40 0.0) (cons 50 rot)))
   )
-
-  ; ── Delete existing GF_Dimensions entities ──────────────────────────────
-  ; Save next BEFORE deleting to avoid broken entnext on soft-deleted ent
-  (setq ent (entnext))
-  (while ent
-    (setq data     (vl-catch-all-apply (quote entget) (list ent)))
-    (setq next_ent (entnext ent))
-    (if (and (not (vl-catch-all-error-p data))
-             (= (cdr (assoc 8 data)) "GF_Dimensions"))
-      (vl-catch-all-apply (quote entdel) (list ent))
-    )
-    (setq ent next_ent)
-  )
-
-  ; ── Ensure layer exists ─────────────────────────────────────────────────
-  ; Use _.-LAYER (dash = non-interactive/scriptable version, no dialog).
-  ; Do NOT wrap command in vl-catch-all-apply — command is a special form.
-  ; Fall back to layer "0" if creation fails so dims still appear.
-  (setq _layer "0")
-  (if (tblsearch "LAYER" "GF_Dimensions")
-    (progn
-      (_dbg "layer GF_Dimensions exists")
-      (setq _layer "GF_Dimensions")
-    )
-    (progn
-      (_dbg "creating layer via command _.-LAYER")
-      (command "_.-LAYER" "N" "GF_Dimensions" "C" "30" "GF_Dimensions" "")
-      (if (tblsearch "LAYER" "GF_Dimensions")
-        (progn (_dbg "layer created OK") (setq _layer "GF_Dimensions"))
-        (_dbg "layer creation failed - using layer 0")
-      )
-    )
-  )
-  (_dbg (strcat "using layer=" _layer))
 
   ; ── Find a valid DIMSTYLE ────────────────────────────────────────────────
   ; getvar "DIMSTYLE" returns boolean T in Fusion — use tblsearch instead
@@ -459,8 +423,11 @@ _LISP_DIM = r'''
       (if (not (or r1 r2 r3))
         (progn
           (_dbg "--- entmake failed, trying command _.DIMLINEAR ---")
-          (setq orig_layer (getvar "CLAYER"))
-          (setvar "CLAYER" _layer)
+
+          ; Disable object snap so our exact bounding-box coords are used,
+          ; not snapped to fillet arc tangent points which shift the measurement.
+          (setq orig_osmode (getvar "OSMODE"))
+          (setvar "OSMODE" 0)
 
           ; Length — vertical (both pts share same X → DIMLINEAR auto-selects vertical)
           (command "_.DIMLINEAR"
@@ -483,7 +450,7 @@ _LISP_DIM = r'''
             (list sx (+ s_top dim_gap) 0.0))
           (_dbg "DIMLINEAR thickness placed")
 
-          (setvar "CLAYER" orig_layer)
+          (setvar "OSMODE" orig_osmode)
           (_dbg "--- DIMLINEAR fallback done ---")
         )
       )

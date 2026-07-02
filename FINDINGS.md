@@ -349,7 +349,7 @@ Fusion's embedded AutoLISP engine is a restricted subset. The following are conf
 
 **Special-form wrapping:** `command` is a special form and **cannot** be wrapped in `vl-catch-all-apply`. Calling `(vl-catch-all-apply (quote command) ...)` causes the script to hang silently. Use bare `(command ...)` calls. Do not confuse `_.LAYER` (opens a dialog, hangs) with `_.-LAYER` (dash prefix = non-interactive, scriptable).
 
-**Confirmed available:** `vl-catch-all-apply`, `vl-catch-all-error-p`, `vl-princ-to-string`, `open`/`close`/`write-line`, `strcat`/`rtos`/`itoa`, `setq`/`if`/`while`/`and`/`not`/`or`/`cond`, `entnext`/`entget`/`entdel`/`entmake` (TEXT), `assoc`/`car`/`cdr`/`cadr`/`list`/`append`/`nth`/`length`, `tblsearch`, `getvar`/`setvar` (most), `=`/`<`/`>`, `abs`/`max`, `princ`, `command`, `defun`.
+**Confirmed available:** `vl-catch-all-apply`, `vl-catch-all-error-p`, `vl-princ-to-string`, `open`/`close`/`write-line`, `strcat`/`rtos`/`itoa`, `setq`/`if`/`while`/`and`/`not`/`or`/`cond`, `entnext`/`entget`/`entdel`/`entmake` (TEXT), `assoc`/`car`/`cdr`/`cadr`/`list`/`append`/`nth`/`length`, `tblsearch`, `getvar`/`setvar` (most, including `OSMODE`), `=`/`<`/`>`, `abs`/`max`, `princ`, `command`, `defun`.
 
 ---
 
@@ -399,30 +399,17 @@ Part edge positions from view centre: `f_left = cx - v_wid*scale*0.5`, `f_top = 
 
 ---
 
-## 10. Layer Operations (Session 3, 2026-07-02)
+## 10. Layers in Fusion Drawings (Session 3, 2026-07-02)
 
-### Creating a layer
+**Fusion's Drawing workspace has no layer system.** There is no layer panel, no layer dropdown, no layer management UI. Fusion uses drawing standards and object properties instead.
 
-`entmake LAYER` returns `nil` in Fusion's engine — not supported. Use the non-interactive dash form of the LAYER command:
+The underlying DWG file format always includes a layer table (layer `"0"` is mandatory in DWG), and `(command "_.-LAYER" ...)` can write to that table. However, Fusion's rendering engine likely only processes entities on its own internal layers — entities placed on custom layers may be invisible.
 
-```lisp
-(command "_.-LAYER" "N" "GF_Dimensions" "C" "30" "GF_Dimensions" "")
-```
-
-- `"N"` = new layer name follows
-- `"GF_Dimensions"` = layer name
-- `"C"` = color assignment follows
-- `"30"` = AutoCAD color index 30 (orange)
-- `"GF_Dimensions"` = apply color to this layer
-- `""` = exit
-
-Check existence first with `(tblsearch "LAYER" "GF_Dimensions")`.
-
-### Placing entities on a layer
+**Conclusion: always use layer `"0"`** for any entity placed via the AutoCAD back-channel. It is always present, always rendered. Do not create custom layers.
 
 ```lisp
-; entmake: (cons 8 layer_name)
-; command: (setvar "CLAYER" layer_name) before, restore after
+; entmake: always (cons 8 "0")
+; command: CLAYER is already "0" by default — no setvar needed
 ```
 
 ### Confirmed DIMSTYLE names
@@ -451,7 +438,37 @@ Button icons live in `resources/<name>/16x16.png`, `32x32.png`, `64x64.png` and 
 
 ---
 
-## 12. Unexplored Leads
+## 12. DIMLINEAR — Confirmed Working (Session 3, 2026-07-02)
+
+`command "_.DIMLINEAR"` with three coordinate lists places a persistent linear dimension on the drawing sheet. Confirmed working as of v1.2.8.
+
+```lisp
+; Disable object snap before picks so exact coordinates are used
+(setq orig_osmode (getvar "OSMODE"))
+(setvar "OSMODE" 0)
+
+(command "_.DIMLINEAR"
+  (list x1 y1 0.0)   ; first extension line origin
+  (list x2 y2 0.0)   ; second extension line origin
+  (list xd yd 0.0))  ; dimension line placement
+
+(setvar "OSMODE" orig_osmode)
+```
+
+**OSMODE must be 0 during the call.** Fusion applies object snap even to AutoLISP coordinate picks. Without disabling it, the pick snaps to the nearest entity — typically a fillet arc tangent point — shortening the measured distance by the fillet radius. Example: a 26mm-wide part with 3mm fillets measures as 20mm (26 − 2×3) if OSMODE is active.
+
+**Vertical vs horizontal selection:** DIMLINEAR auto-selects based on the two extension line origins:
+- Same X → vertical dimension (measuring Y distance)
+- Same Y → horizontal dimension (measuring X distance)
+- Different X and Y → direction determined by where the dimension line location point falls
+
+**entmake DIMENSION is confirmed NOT supported** in Fusion's AutoLISP engine — always returns nil. DIMLINEAR via `command` is the correct path.
+
+**`getvar "OSMODE"` / `setvar "OSMODE"` are confirmed working.** Save and restore the value around DIMLINEAR calls.
+
+---
+
+## 13. Unexplored Leads
 
 - **`FusionDoc.InvokeDrawingCmdById FusionDrawingSingleDimensionCmd`** — Confirmed working: starts Fusion's native dimension command. However Fusion's C++ selection loop does not respond to `FusionDoc.AcadParameters` — the command waits for user mouse input and cannot be driven programmatically this way. Cursor position can be set via `FusionDoc.SetCursorPos` (confirmed working), but click simulation (Click, LeftClick, PickAt, SendClick) remains untested.
 - **`FusionDoc.SelectObject`** — Returns "Set invalid object selector" for all handle formats tried (hex handles, space-separated coords, comma-separated coords). Format unknown.
