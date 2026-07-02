@@ -1,0 +1,9 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "engine": "Python",
+  "author": "Danecca / GhostForge",
+  "description": "Dumps DWG entity database via AutoLISP and probes FusionDoc.InvokeDrawingCmdById",
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}

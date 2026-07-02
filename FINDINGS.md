@@ -332,10 +332,129 @@ Never blindly multiply all parameters by 10. Dimensionless parameters (e.g. `Tan
 
 ---
 
-## 8. Unexplored Leads
+## 8. AutoLISP Subset — Confirmed Constraints (Session 3, 2026-07-02)
 
-- **`FusionDoc.InvokeDrawingCmdById`** — "Execute Fusion Doc drawing command by id". Unknown parameter format. Could be the programmatic gateway to placing Fusion-native annotations (with associativity to model geometry) rather than raw AutoCAD geometry.
-- **`FusionDoc.SetCursorPos`** + **`FusionDoc.SelectObject`** — Could enable selecting drawing view entities before firing a dimension command, producing associative (model-linked) dimensions rather than paper-space dimensions.
-- **April 2026 PMI API additions** — Autodesk added 40+ typed PMI (Product and Manufacturing Information) objects to `adsk.fusion` (Design workspace). These are 3D annotations on the model, not drawing-sheet objects. Unexplored as of this writing. May be a cleaner path to MBD-style annotation.
-- **`DIMLINEAR` text override** — AutoCAD's DIMLINEAR accepts a `T` option to override the displayed value. Could be used to place a dimension that shows a sketch parameter value even when the paper-space geometry doesn't match the model dimension exactly.
-- **Script file with full drawing** — Since `.scr` can drive any AutoCAD command, a complete drawing annotation run (multiple views' worth of sketch parameters) could be driven by a single generated script file.
+Fusion's embedded AutoLISP engine is a restricted subset. The following are confirmed absent:
+
+| Function | Symptom | Workaround |
+|---|---|---|
+| `foreach` | Silent crash / no execution | Replace with `while` / `cdr` loop |
+| `stringp` | Undefined function | Remove predicate; use `if val` or `if (= ...)` |
+| `listp` | Undefined function | Remove predicate; always treat pair as alist |
+| `equal` | Silent crash on string comparison | Use `=` for all comparisons (works for strings too) |
+| `entmake LAYER` | Returns `nil` | Use `command "_.-LAYER" "N" name "C" color name ""` |
+| `entmake DIMENSION` | Returns `nil` | Use bare `command "_.DIMLINEAR"` |
+| `(getvar "CTAB")` | Returns boolean `T` | Extract layout from DRAWINGVIEW entity group 410 |
+| `(getvar "DIMSTYLE")` | Returns boolean `T` | Find via `(tblsearch "DIMSTYLE" name)` |
+
+**Special-form wrapping:** `command` is a special form and **cannot** be wrapped in `vl-catch-all-apply`. Calling `(vl-catch-all-apply (quote command) ...)` causes the script to hang silently. Use bare `(command ...)` calls. Do not confuse `_.LAYER` (opens a dialog, hangs) with `_.-LAYER` (dash prefix = non-interactive, scriptable).
+
+**Confirmed available:** `vl-catch-all-apply`, `vl-catch-all-error-p`, `vl-princ-to-string`, `open`/`close`/`write-line`, `strcat`/`rtos`/`itoa`, `setq`/`if`/`while`/`and`/`not`/`or`/`cond`, `entnext`/`entget`/`entdel`/`entmake` (TEXT), `assoc`/`car`/`cdr`/`cadr`/`list`/`append`/`nth`/`length`, `tblsearch`, `getvar`/`setvar` (most), `=`/`<`/`>`, `abs`/`max`, `princ`, `command`, `defun`.
+
+---
+
+## 9. DRAWINGVIEW Entity Structure (Session 3, 2026-07-02)
+
+Drawing views are stored as `DRAWINGVIEW` entities in the DWG database. They can be walked using `entnext`/`entget`.
+
+**Group codes of interest:**
+
+| Group | Occurrences | Content |
+|---|---|---|
+| `0` | 1 | `"DRAWINGVIEW"` |
+| `5` | 1 | Entity handle (hex string) |
+| `410` | 1 | Layout name (e.g. `"Sheet1"`) — use this instead of `getvar "CTAB"` |
+| `40` | 4 | In order: `scale`, `0.0`, `cx`, `cy` (paper-space centre in mm) |
+| `10` | 2 | In order: bbox lower-left, bbox upper-right (paper-space mm) |
+
+**Extracting view geometry:**
+
+```lisp
+; Collect all group-40 and group-10 values via while/cdr (no foreach)
+(setq g40s nil  g10s nil  pair (entget ent))
+(while pair
+  (cond
+    ((= (car (car pair)) 40) (setq g40s (append g40s (list (cdr (car pair))))))
+    ((= (car (car pair)) 10) (setq g10s (append g10s (list (cdr (car pair))))))
+  )
+  (setq pair (cdr pair))
+)
+; Then:
+; scale  = (nth 0 g40s)
+; cx, cy = (nth 2 g40s), (nth 3 g40s)  ← view centre in paper-space mm
+; bbox_w = (abs (- (car  (nth 1 g10s)) (car  (nth 0 g10s))))
+; bbox_h = (abs (- (cadr (nth 1 g10s)) (cadr (nth 0 g10s))))
+```
+
+**Identifying front vs side view:** The front (larger) view has a wider bbox_w than the side (narrower) view. Use `(>= (nth 3 view_a) (nth 3 view_b))` to sort.
+
+**Confirmed coordinates (Cork part, 111×26×3 mm at 1:1 scale):**
+
+| View | cx | cy | scale |
+|---|---|---|---|
+| Front | 142.035 | 180.276 | 1.0 |
+| Side | 225.421 | 180.276 | 1.0 |
+
+Part edge positions from view centre: `f_left = cx - v_wid*scale*0.5`, `f_top = cy + v_len*scale*0.5`, etc.
+
+---
+
+## 10. Layer Operations (Session 3, 2026-07-02)
+
+### Creating a layer
+
+`entmake LAYER` returns `nil` in Fusion's engine — not supported. Use the non-interactive dash form of the LAYER command:
+
+```lisp
+(command "_.-LAYER" "N" "GF_Dimensions" "C" "30" "GF_Dimensions" "")
+```
+
+- `"N"` = new layer name follows
+- `"GF_Dimensions"` = layer name
+- `"C"` = color assignment follows
+- `"30"` = AutoCAD color index 30 (orange)
+- `"GF_Dimensions"` = apply color to this layer
+- `""` = exit
+
+Check existence first with `(tblsearch "LAYER" "GF_Dimensions")`.
+
+### Placing entities on a layer
+
+```lisp
+; entmake: (cons 8 layer_name)
+; command: (setvar "CLAYER" layer_name) before, restore after
+```
+
+### Confirmed DIMSTYLE names
+
+In Fusion drawings, `(tblsearch "DIMSTYLE" "FD_Dimensions_Style")` returns `nil`. `(tblsearch "DIMSTYLE" "Standard")` returns the entry. Use `"Standard"` as the fallback.
+
+---
+
+## 11. GhostForge Unified Add-In Architecture (Session 3, 2026-07-02)
+
+`src/GhostForge/` replaces the separate `SketchAnnotate` and `DimAnnotate` add-ins with a single unified add-in. It creates a dedicated **GhostForge** tab at the top level of the Drawing workspace (same hierarchy as the built-in Drawing / Manage / Utilities tabs) via:
+
+```python
+ws  = ui.workspaces.itemById('FusionDocumentationEnvironment')
+tab = ws.toolbarTabs.add('GhostForge_Tab', 'GhostForge')
+```
+
+Three separate panels (one per command) prevent the flyout dropdown that appears when multiple commands share one panel. Each command is promoted:
+
+```python
+ctrl.isPromoted         = True
+ctrl.isPromotedByDefault = True
+```
+
+Button icons live in `resources/<name>/16x16.png`, `32x32.png`, `64x64.png` and are referenced by absolute path as the 4th argument to `addButtonDefinition`.
+
+---
+
+## 12. Unexplored Leads
+
+- **`FusionDoc.InvokeDrawingCmdById FusionDrawingSingleDimensionCmd`** — Confirmed working: starts Fusion's native dimension command. However Fusion's C++ selection loop does not respond to `FusionDoc.AcadParameters` — the command waits for user mouse input and cannot be driven programmatically this way. Cursor position can be set via `FusionDoc.SetCursorPos` (confirmed working), but click simulation (Click, LeftClick, PickAt, SendClick) remains untested.
+- **`FusionDoc.SelectObject`** — Returns "Set invalid object selector" for all handle formats tried (hex handles, space-separated coords, comma-separated coords). Format unknown.
+- **April 2026 PMI API additions** — Autodesk added 40+ typed PMI objects to `adsk.fusion` (Design workspace). 3D model annotations, not drawing-sheet objects. Unexplored.
+- **`DIMLINEAR T` text override** — AutoCAD's DIMLINEAR accepts a `T` option to override the displayed text. Could show a sketch parameter value independent of the paper-space measurement — useful if view scale or geometry placement is imprecise.
+- **Complete drawing from a single `.scr` file** — All annotation for a multi-view drawing could be driven by one generated script, keeping Fusion's Python side trivially thin.

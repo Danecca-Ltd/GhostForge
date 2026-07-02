@@ -1,0 +1,9 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "engine": "Python",
+  "author": "Danecca / GhostForge",
+  "description": "Places DIMENSION entities on the active drawing via AutoLISP entmake. Reads design parameters for group-42 stored values; reads DRAWINGVIEW entities for view geometry. Run again to refresh after design changes.",
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
