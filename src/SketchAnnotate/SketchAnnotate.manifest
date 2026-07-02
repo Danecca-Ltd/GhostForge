@@ -1,0 +1,9 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "engine": "Python",
+  "author": "Danecca / GhostForge",
+  "description": "Reads sketch parameters from the linked design and places them as persistent text annotations on the active drawing sheet via the AutoCAD back channel",
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}

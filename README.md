@@ -55,31 +55,51 @@ The same mechanism works for circles, dimensions, and — via an AutoCAD script 
 
 Sheet coordinate system: **1 unit = 1 mm**, origin at sheet corner, Y increasing upward.
 
-## Repository Structure
-
-```
-probes/          Runtime probes used during research
-  DrawingProbe/  Enumerates the full adsk.drawing object tree at runtime
-  CommandRecorder/ Hooks commandStarting — logs all drawing command IDs
-  DimCmdProbe/   Before/after snapshot of sheet when dimension command fires
-  AcadTest/      Progressive tests of FusionDoc.ExecuteAcadCommand
-
-src/
-  SketchDimTable/ Working add-in: places sketch dimensions as a custom table
-
-docs/
-  drawing-api-limits.md    What adsk.drawing exposes (and doesn't)
-  fusionddoc-commands.md   FusionDoc text command reference
-  coordinate-system.md     Sheet coordinate system and scale
-  command-ids.md           Captured drawing command IDs
-```
-
 ## Credits and References
 
 - [kantoku-code/Fusion360_Small_Tools_for_Developers](https://github.com/kantoku-code/Fusion360_Small_Tools_for_Developers) — TextCommands list, the original source that revealed `FusionDoc.ExecuteAcadCommand` and the full command surface
 - [schneik80/PowerTools-Document-Tools](https://github.com/schneik80/PowerTools-Document-Tools) — First known real-world usage of `FusionDoc.ExecuteAcadCommand` in a production add-in (Open DWG command), including the critical `command_destroy` safety pattern
 - Autodesk Community forum post by kantoku that revealed AutoCAD commands draw persistent geometry in Fusion drawings
 
+## Repository Structure
+
+```
+probes/             Runtime probes used during research
+  DrawingProbe/     Enumerates the full adsk.drawing object tree at runtime
+  CommandRecorder/  Hooks commandStarting — logs all drawing command IDs
+  DimCmdProbe/      Before/after snapshot of sheet when dimension command fires
+  AcadTest/         Progressive tests of FusionDoc.ExecuteAcadCommand
+
+src/
+  SketchDimTable/   Add-in: places sketch dimensions as a custom table (two-pass)
+  SketchAnnotate/   Add-in: places sketch parameters as text annotations via .scr
+```
+
+## SketchAnnotate
+
+The first production add-in built on the GhostForge mechanism. Reads every sketch dimension from the open design and places them as persistent text entities on the active drawing sheet using a generated AutoCAD `.scr` script.
+
+**Usage:** Open both the Design and the Drawing. Switch to the Drawing workspace. Click **Sketch Annotate** (Dimensions panel). Set start position (X, Y in mm from sheet origin) and text height. Click OK.
+
+**Output format:**
+```
+[[ Sketch1 ]]
+d1 = 25.000 mm  (Lin)
+d2 = 50.000 mm  (Lin)
+r1 = 10.000 mm  (Rad)
+
+[[ Sketch2 ]]
+...
+```
+
+Text persists after save, close, and reopen — it is stored in the DWG layer of the drawing file.
+
 ## Status
 
-Research phase. The text command channel is proven. Next milestone: `GhostForge.Draw` — an add-in that reads sketch parameters from the linked design and places them as annotated text labels on the active drawing sheet using the `.scr` script mechanism.
+SketchAnnotate is working. Known limitations:
+
+- Text is unassociative — it does not update when the design changes
+- No view-position awareness — annotations are placed at a user-specified fixed location rather than near the corresponding view geometry
+- `adsk.drawing` still cannot read back what was placed (Autodesk has not bound annotation objects to Python)
+
+Open research threads: `FusionDoc.InvokeDrawingCmdById`, `FusionDoc.SetCursorPos + SelectObject`, April 2026 PMI API additions in `adsk.fusion`.
