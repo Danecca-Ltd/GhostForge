@@ -1,0 +1,9 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "engine": "Python",
+  "author": "Fusion Gadgets",
+  "description": "Silently logs all Fusion command IDs to Desktop/fusion_commands.tsv — start as add-in, operate drawing, then stop the add-in",
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}

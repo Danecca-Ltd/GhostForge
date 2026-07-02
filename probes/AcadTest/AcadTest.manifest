@@ -1,0 +1,9 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "engine": "Python",
+  "author": "Fusion Gadgets",
+  "description": "Tests FusionDoc.ExecuteAcadCommand — places lines, text, and dimensions on the active drawing sheet",
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}

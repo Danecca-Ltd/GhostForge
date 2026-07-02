@@ -1,0 +1,9 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "engine": "Python",
+  "author": "Fusion Gadgets",
+  "description": "Hooks commandCreated on FusionDrawingSingleDimensionCmd and dumps all CommandInputs to Desktop/dim_cmd_probe.txt",
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}

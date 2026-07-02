@@ -1,0 +1,9 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "script",
+  "engine": "Python",
+  "author": "Fusion Gadgets",
+  "description": "Places a table of sketch dimensions from the linked design onto the active drawing sheet",
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}

@@ -1,0 +1,9 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "script",
+  "engine": "Python",
+  "author": "Fusion Gadgets",
+  "description": "Probes the Drawing API object tree at runtime",
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
