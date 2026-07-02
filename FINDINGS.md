@@ -158,7 +158,24 @@ app.executeTextCommand(f'FusionDoc.ExecuteAcadCommand _.SCRIPT "{scr_path}"')
 
 **Confirmed working:** Text label `d1 = 25.400 mm` appeared on drawing sheet and persisted after save/reopen.
 
-**TEXT command termination:** Each TEXT invocation requires a blank line to end it (TEXT repeats by default asking for next position). Use double blank line to be safe.
+**TEXT command termination — BROKEN:** Fusion's embedded AutoCAD runs `_.TEXT` in DTEXT (dynamic text) mode. Blank lines do **not** exit the command — they are treated as empty continuation lines. Every subsequent line in the script is placed as literal text on the sheet. `_.TEXT` cannot be used for multi-entity text placement via `.scr` files.
+
+### AutoLISP `entmake` — confirmed working
+
+Fusion's embedded AutoCAD engine includes AutoLISP. A `.scr` file can contain AutoLISP expressions directly (one per line), and they execute immediately with no interactive exit sequence required.
+
+```python
+# Each line in the .scr file creates one TEXT entity:
+'(entmake (list (cons 0 "TEXT")'
+' (cons 1 "annotation text")'
+' (cons 10 (list 10.0 250.0 0.0))'   # insertion point x,y,z in mm
+' (cons 40 4.0)'                       # text height in mm
+' (cons 50 0.0)))'                     # rotation in radians
+```
+
+This is the **preferred mechanism for placing text**. DXF group codes for TEXT: `0` = entity type, `1` = string, `10` = insertion point, `40` = height, `50` = rotation (radians).
+
+No exit sequence needed. Each `(entmake ...)` call is self-contained and returns immediately. The script can contain arbitrarily many of them.
 
 ### `FusionDoc.IpeInput`
 
@@ -253,7 +270,69 @@ FusionDoc.CreateTemplate              CreateDrawingTemplate
 
 ---
 
-## 7. Unexplored Leads
+## 7. Python API Gotchas
+
+### `app.documents.item()` returns typed subclass, not `Document`
+
+`app.documents.item(i)` returns `adsk.fusion.FusionDocument` (for design documents) or `adsk.core.DrawingDocument` (for drawings), not the base `adsk.core.Document`. The typed subclasses do not expose `.documentType`. To find an open design without triggering `AttributeError`, try-cast to a Design product directly:
+
+```python
+def find_open_design():
+    for i in range(app.documents.count):
+        try:
+            doc    = app.documents.item(i)
+            design = adsk.fusion.Design.cast(
+                doc.products.itemByProductType('DesignProductType'))
+            if design:
+                return design
+        except Exception:
+            continue
+    return None
+```
+
+### SWIG proxy attribute loss between event handlers
+
+Stashing a value on `args.command` in `ExecuteHandler` (e.g. `args.command._my_flag = True`) is **not visible** in `DestroyHandler`. Each handler receives a different Python SWIG proxy wrapping the same underlying C++ command object. Python attributes set on one proxy do not propagate to another. Use a **module-level dict** instead:
+
+```python
+_pending = {}
+
+class ExecuteHandler(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        _pending['x'] = args.command.commandInputs.itemById('x').value
+        _pending['ok'] = True
+
+class DestroyHandler(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        if not _pending.pop('ok', False):
+            return   # user cancelled
+        x = _pending['x']
+        ...
+```
+
+### Feature parameter access
+
+| Feature | What works | What doesn't |
+|---|---|---|
+| `ExtrudeFeature` | `DistanceExtentDefinition.cast(ef.extentOne).distance` → `ModelParameter` | — |
+| `FilletFeature` | `design.allParameters` minus already-known names | `ff.parameters` not bound in current API |
+| All features | `design.allParameters` (all model params including sketch dims) | No `.parentFeature` on `ModelParameter` |
+
+### Unit-aware parameter handling
+
+`ModelParameter.value` is always in Fusion internal units. `ModelParameter.unit` tells you the display type:
+
+| `.unit` value | Internal unit | Display conversion |
+|---|---|---|
+| `'mm'`, `'cm'`, `'in'` etc. | cm | multiply by 10 → mm |
+| `'deg'` | radians | `math.degrees(value)` |
+| `''` or `'ul'` | dimensionless | skip — internal weights, not engineering values |
+
+Never blindly multiply all parameters by 10. Dimensionless parameters (e.g. `TangencyWeight = 1`) become `10 mm` otherwise.
+
+---
+
+## 8. Unexplored Leads
 
 - **`FusionDoc.InvokeDrawingCmdById`** — "Execute Fusion Doc drawing command by id". Unknown parameter format. Could be the programmatic gateway to placing Fusion-native annotations (with associativity to model geometry) rather than raw AutoCAD geometry.
 - **`FusionDoc.SetCursorPos`** + **`FusionDoc.SelectObject`** — Could enable selecting drawing view entities before firing a dimension command, producing associative (model-linked) dimensions rather than paper-space dimensions.

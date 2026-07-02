@@ -48,7 +48,12 @@ The same mechanism works for circles, dimensions, and — via an AutoCAD script 
 | `FusionDoc.ExecuteAcadCommand _.CIRCLE` | ✓ | Persistent geometry |
 | `FusionDoc.ExecuteAcadCommand _.DIMLINEAR` | ✓ | Real dimension annotation |
 | `FusionDoc.AcadParameters` | ✓ | Coordinates and numeric values |
-| `FusionDoc.ExecuteAcadCommand _.SCRIPT` | ✓ | Script files for text content |
+| `FusionDoc.ExecuteAcadCommand _.SCRIPT` | ✓ | Executes AutoCAD script files |
+| AutoLISP `(entmake ...)` in `.scr` files | ✓ | **Best mechanism for text** — no exit sequence needed |
+| `ExtrudeFeature` depth via `DistanceExtentDefinition` | ✓ | Full access to extrude parameters |
+| `design.allParameters` | ✓ | All model parameters including sketch dims |
+| `_.TEXT` in `.scr` for multi-entity placement | ✗ | DTEXT mode — blank lines don't exit, subsequent lines placed as text |
+| `FilletFeature.parameters` | ✗ | Not bound in current Fusion Python API |
 | `adsk.drawing` Sheet annotations | ✗ | Not bound in Python API |
 | `commandCreated` on built-in drawing commands | ✗ | Not exposed for built-in cmds |
 | `FusionDoc.IpeInput` | ✗ | Crashes Python thread if no IPE active |
@@ -83,23 +88,33 @@ The first production add-in built on the GhostForge mechanism. Reads every sketc
 
 **Output format:**
 ```
-[[ Sketch1 ]]
-d1 = 25.000 mm  (Lin)
-d2 = 50.000 mm  (Lin)
-r1 = 10.000 mm  (Rad)
+== Sketch1 ==
+d1 = 111.000 mm  Lin
+d2 = 26.000 mm  Lin
 
-[[ Sketch2 ]]
-...
+== Extrude ==
+d3 = 3.000 mm  Extrude1
+
+== Other Features ==
+d4 = 3.000 mm  Feature      <- fillet radius
+taper = 0.00 deg            <- taper angle (if non-zero)
 ```
 
-Text persists after save, close, and reopen — it is stored in the DWG layer of the drawing file.
+Text entities are placed using AutoLISP `(entmake ...)` — one call per annotation, no interactive command exit sequence required. Persists after save, close, and reopen.
+
+**Parameter sources collected:**
+- Sketch dimensions via `sketch.sketchDimensions`
+- Extrude depths via `DistanceExtentDefinition.cast(ef.extentOne).distance`
+- Everything else via `design.allParameters` minus already-collected names
+- Unit-aware: length `× 10` (cm→mm), angles `math.degrees()`, dimensionless skipped
 
 ## Status
 
-SketchAnnotate is working. Known limitations:
+SketchAnnotate is working end-to-end. Known limitations:
 
-- Text is unassociative — it does not update when the design changes
-- No view-position awareness — annotations are placed at a user-specified fixed location rather than near the corresponding view geometry
-- `adsk.drawing` still cannot read back what was placed (Autodesk has not bound annotation objects to Python)
+- Text is unassociative — does not update when the design changes
+- No view-position awareness — placed at a user-specified point, not near view geometry
+- `adsk.drawing` cannot read back placed annotations (C++ objects not bound to Python)
+- Fillet radii appear in "Other Features" — `FilletFeature.parameters` not bound in current API
 
 Open research threads: `FusionDoc.InvokeDrawingCmdById`, `FusionDoc.SetCursorPos + SelectObject`, April 2026 PMI API additions in `adsk.fusion`.

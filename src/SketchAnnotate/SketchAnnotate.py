@@ -2,10 +2,12 @@ import adsk.core
 import adsk.fusion
 import adsk.drawing
 import os
+import math
 
 app = None
 ui  = None
 handlers = []
+_pending = {}   # cross-handler value store (avoids SWIG proxy attribute loss)
 
 CMD_ID       = 'FusionGadgets_SketchAnnotate'
 CMD_NAME     = 'Sketch Annotate'
@@ -31,17 +33,29 @@ TYPE_MAP = {
 
 def find_open_design():
     for i in range(app.documents.count):
-        doc = app.documents.item(i)
-        if doc.documentType == adsk.core.DocumentTypes.FusionDesignDocumentType:
-            return adsk.fusion.Design.cast(
+        try:
+            doc    = app.documents.item(i)
+            design = adsk.fusion.Design.cast(
                 doc.products.itemByProductType('DesignProductType'))
+            if design:
+                return design
+        except Exception:
+            continue
     return None
 
 
-def collect_by_sketch(design):
-    """Return dict: sketch_name -> [(param_name, value_mm, type_label)]."""
+def collect_all_params(design):
+    """Return ordered dict: group_name -> [(param_name, value_mm, label)].
+
+    Groups: one per sketch, then 'Extrude', then 'Fillet'.
+    Extrude depths come from DistanceExtentDefinition.distance (reliable).
+    Fillet radii come from FilletFeature.parameters (API v2+; skipped if absent).
+    """
     result = {}
+
     for comp in design.allComponents:
+
+        # --- Sketch dimensions ---
         for sketch in comp.sketches:
             rows = []
             for dim in sketch.sketchDimensions:
@@ -55,21 +69,63 @@ def collect_by_sketch(design):
                 except Exception:
                     continue
             if rows:
-                result[sketch.name] = rows
+                result.setdefault(sketch.name, []).extend(rows)
+
+        # --- Extrude depths ---
+        extrude_rows = []
+        for i in range(comp.features.extrudeFeatures.count):
+            try:
+                ef = comp.features.extrudeFeatures.item(i)
+                for side in ('extentOne', 'extentTwo'):
+                    try:
+                        ext = getattr(ef, side)
+                        dist_def = adsk.fusion.DistanceExtentDefinition.cast(ext)
+                        if dist_def:
+                            p = dist_def.distance
+                            if p:
+                                extrude_rows.append(
+                                    (p.name, p.value * INTERNAL_TO_MM, ef.name))
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        if extrude_rows:
+            result['Extrude'] = extrude_rows
+
+    # --- Remaining parameters (fillet radii, chamfers, etc.) ---
+    # FilletFeature doesn't expose .parameters in all Fusion API versions.
+    # Fallback: allParameters minus what sketch/extrude already captured.
+    known = {name for rows in result.values() for name, _, _ in rows}
+    other_rows = []
+    try:
+        all_params = design.allParameters
+        for i in range(all_params.count):
+            p = all_params.item(i)
+            if p.name not in known:
+                unit = (p.unit or '').strip()
+                if unit in ('', 'ul', 'unitless'):
+                    continue                        # dimensionless (TangencyWeight etc.) — skip
+                if unit == 'deg':
+                    display_val = math.degrees(p.value)
+                    label = 'deg'
+                else:
+                    display_val = p.value * INTERNAL_TO_MM   # cm → mm
+                    label = 'Feature'
+                other_rows.append((p.name, display_val, label))
+    except Exception:
+        pass
+    if other_rows:
+        result['Other Features'] = other_rows
+
     return result
 
 
 def build_scr(sketch_groups, x, y_start, height, spacing, scr_path):
-    """Write AutoCAD .scr placing one TEXT entity per sketch dimension.
+    """Write .scr using AutoLISP entmake to create TEXT entities directly.
 
-    Sheet coordinate Y decreases downward (Y-up system, so lines stack visually down).
-    Each TEXT block:
-        _.TEXT
-        x,y
-        height
-        0           <- rotation
-        content
-                    <- blank line = Enter with no text = exit TEXT command
+    One (entmake ...) call per annotation — no interactive command, no exit sequence.
+    DXF group codes for TEXT: 0=entity type, 1=string, 10=insertion point,
+    40=height, 50=rotation (radians, 0.0 = horizontal).
     """
     lines = []
     y = float(y_start)
@@ -77,26 +133,28 @@ def build_scr(sketch_groups, x, y_start, height, spacing, scr_path):
 
     def add_text(content):
         nonlocal y
-        lines.append('_.TEXT')
-        lines.append(f'{float(x):.2f},{y:.2f}')
-        lines.append(f'{float(height):.2f}')
-        lines.append('0')
-        lines.append(content)
-        lines.append('')
+        safe = content.replace('\\', '\\\\').replace('"', "'")
+        lines.append(
+            f'(entmake (list (cons 0 "TEXT")'
+            f' (cons 1 "{safe}")'
+            f' (cons 10 (list {float(x):.4f} {y:.4f} 0.0))'
+            f' (cons 40 {float(height):.4f})'
+            f' (cons 50 0.0)))'
+        )
         y -= float(spacing)
 
     for sketch_name, dims in sketch_groups.items():
-        add_text(f'[[ {sketch_name} ]]')
+        add_text(f'== {sketch_name} ==')
         y -= float(spacing) * 0.4
 
-        for param_name, value_mm, dim_type in dims:
-            add_text(f'{param_name} = {value_mm:.3f} mm  ({dim_type})')
+        for param_name, val, label in dims:
+            if label == 'deg':
+                add_text(f'{param_name} = {val:.2f} deg')
+            else:
+                add_text(f'{param_name} = {val:.3f} mm  {label}')
             total += 1
 
         y -= float(spacing) * 0.6
-
-    # Trailing blanks to exit any command left active by the script
-    lines += ['', '', '']
 
     with open(scr_path, 'w', encoding='ascii', errors='replace') as f:
         f.write('\n'.join(lines) + '\n')
@@ -139,27 +197,25 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
 
 class ExecuteHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
-        # Capture spinner values here (integer = mm directly).
+        # Capture spinner values into module-level dict.
+        # Cannot stash on args.command — SWIG proxy attributes are lost between handlers.
         # Do NOT call executeTextCommand here — reentrancy crashes Fusion.
-        # Instead, stash values on the command object for DestroyHandler.
-        cmd    = args.command
-        inputs = cmd.commandInputs
-        cmd._sa_x      = inputs.itemById('x_pos').value
-        cmd._sa_y      = inputs.itemById('y_pos').value
-        cmd._sa_height = inputs.itemById('txt_height').value
-        cmd._sa_ok     = True
+        inputs = args.command.commandInputs
+        _pending['x']      = inputs.itemById('x_pos').value
+        _pending['y']      = inputs.itemById('y_pos').value
+        _pending['height'] = inputs.itemById('txt_height').value
+        _pending['ok']     = True
 
 
 class DestroyHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
-        cmd = args.command
-        if not getattr(cmd, '_sa_ok', False):
+        if not _pending.pop('ok', False):
             return  # user cancelled
 
         try:
-            x      = cmd._sa_x       # mm = sheet coordinate units directly
-            y      = cmd._sa_y
-            height = cmd._sa_height
+            x      = _pending['x']
+            y      = _pending['y']
+            height = _pending['height']
             spacing = height * 2.0   # 2× height = comfortable line spacing
 
             design = find_open_design()
@@ -169,7 +225,7 @@ class DestroyHandler(adsk.core.CommandEventHandler):
                     'Open the referenced design document first, then try again.')
                 return
 
-            sketch_groups = collect_by_sketch(design)
+            sketch_groups = collect_all_params(design)
             if not sketch_groups:
                 ui.messageBox(
                     'SketchAnnotate: no sketch dimensions found in the design.\n'
