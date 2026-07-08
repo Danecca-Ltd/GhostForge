@@ -3,6 +3,7 @@
 Single panel in the Drawing workspace (FusionDocTab) containing:
   • Sketch Annotate  — places all sketch parameters as text
   • Dim Annotate     — places 3 AcDbRotatedDimension entities (L / W / T)
+  • Dim Checklist    — feature-by-feature checklist for selective annotation
   • DWG Probe        — diagnostic entity dump + command trials (dev tool)
 """
 import adsk.core, adsk.fusion, adsk.drawing, os, math
@@ -11,7 +12,7 @@ import adsk.core, adsk.fusion, adsk.drawing, os, math
 app      = None
 ui       = None
 handlers = []
-_pending = {'sketch': {}, 'dims': {}, 'probe': {}}   # namespaced per command
+_pending = {'sketch': {}, 'dims': {}, 'probe': {}, 'fc': {}}   # namespaced per command
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 WORKSPACE_ID = 'FusionDocumentationEnvironment'
@@ -21,10 +22,12 @@ GF_TAB_NAME  = 'GhostForge'
 # One panel per command so each shows as a standalone button in the tab
 GF_SA_PANEL  = 'GhostForge_SA_Panel'
 GF_DA_PANEL  = 'GhostForge_DA_Panel'
+GF_FC_PANEL  = 'GhostForge_FC_Panel'
 GF_DP_PANEL  = 'GhostForge_DP_Panel'
 
 CMD_SKETCH   = 'GhostForge_SketchAnnotate'
 CMD_DIMS     = 'GhostForge_DimAnnotate'
+CMD_FC       = 'GhostForge_FeatureChecklist'
 CMD_PROBE    = 'GhostForge_DwgProbe'
 
 INTERNAL_TO_MM = 10.0
@@ -179,6 +182,107 @@ def collect_top3_lengths(design):
     return rows[:3]
 
 
+def _fillet_radius_mm(feat):
+    """Extract radius in mm from a FilletFeature using multiple strategies.
+
+    Strategy 1 (preferred): feat.edgeSets.item(j).radius — ModelParameter on a
+    ConstantRadiusFilletEdgeSet; this is the documented Fusion API path.
+    Strategy 2 (fallback): direct attributes on the feature object itself.
+    """
+    try:
+        for j in range(feat.edgeSets.count):
+            try:
+                r = feat.edgeSets.item(j).radius
+                if r is not None and hasattr(r, 'value') and r.value > 0:
+                    return r.value * INTERNAL_TO_MM
+            except Exception:
+                pass
+    except Exception:
+        pass
+    for attr in ('constantRadius', 'radius'):
+        try:
+            r = getattr(feat, attr)
+            if r is not None and hasattr(r, 'value') and r.value > 0:
+                return r.value * INTERNAL_TO_MM
+        except Exception:
+            pass
+    return None
+
+
+def get_fillet_radius(design):
+    """Return the first fillet feature radius in mm, or None."""
+    try:
+        for comp in design.allComponents:
+            try:
+                ff = comp.features.filletFeatures
+                for i in range(ff.count):
+                    try:
+                        r = _fillet_radius_mm(ff.item(i))
+                        if r is not None:
+                            return round(r, 4)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def collect_feature_list(design):
+    """Return annotatable features with sketch associations for the checklist dialog."""
+    result = []
+    params = collect_top3_lengths(design)
+    param_str = (f'L={params[0][1]:.1f}, W={params[1][1]:.1f}, T={params[2][1]:.1f} mm'
+                 if len(params) >= 3 else '?')
+
+    for comp in design.allComponents:
+        try:
+            for i in range(comp.features.extrudeFeatures.count):
+                feat = comp.features.extrudeFeatures.item(i)
+                sketch_name = None
+                try:
+                    sketch_name = feat.profile.parentSketch.name
+                except Exception:
+                    pass
+                label = (f'{feat.name}  ({sketch_name})' if sketch_name else feat.name)
+                result.append({'id': f'extrude_{i}', 'type': 'extrude',
+                               'label': label, 'params_str': param_str})
+        except Exception:
+            pass
+
+        try:
+            for i in range(comp.features.filletFeatures.count):
+                feat = comp.features.filletFeatures.item(i)
+                r_raw = _fillet_radius_mm(feat)
+                r = round(r_raw, 1) if r_raw is not None else None
+                result.append({'id': f'fillet_{i}', 'type': 'fillet',
+                               'label': feat.name,
+                               'params_str': f'R{r:.1f} mm' if r is not None else 'R?'})
+        except Exception:
+            pass
+
+    return result
+
+
+def _diag_design(design):
+    """Return a short diagnostic string for debugging parameter collection."""
+    try:
+        n_comp   = design.allComponents.count
+        n_sketch = sum(c.sketches.count for c in design.allComponents)
+        n_dims   = sum(s.sketchDimensions.count
+                       for c in design.allComponents for s in c.sketches)
+        try:
+            n_params = design.allParameters.count
+        except Exception:
+            n_params = '?'
+        return (f'design="{design.parentDocument.name}"  '
+                f'components={n_comp}  sketches={n_sketch}  '
+                f'sketchDims={n_dims}  allParams={n_params}')
+    except Exception as e:
+        return f'diag failed: {e}'
+
+
 # ─── SketchAnnotate ───────────────────────────────────────────────────────────
 
 def _build_sketch_scr(sketch_groups, x, y_start, height, spacing, scr_path):
@@ -279,25 +383,53 @@ class SADestroyHandler(adsk.core.CommandEventHandler):
 # ─── DimAnnotate ─────────────────────────────────────────────────────────────
 
 _LISP_DIM = r'''
-(defun _gf_dim (/ _mkdim _dbg
+(defun _gf_dim (/ _mkdim _dbg _fixdim _de _dd _emr
                    ent data next_ent views front side lv
                    fx fy fscale fw fh sx sy sscale sw sh
                    f_left f_right f_top f_bot s_left s_right s_top
-                   dim_gap layout r1 r2 r3 orig_osmode
-                   g40s g10s pair _style _dbgf)
+                   dim_gap layout r1 r2 r3
+                   g40s g10s pair _style _dbgf
+                   _ae _ae_found _ad _ar _acx _acy _adx _ady _adl _apx _apy)
 
   ; ── Setup ──────────────────────────────────────────────────────────────
   ; NOTE: (getvar "CTAB") and (getvar "DIMSTYLE") return boolean T in
   ;       Fusion's LISP — NOT strings.  Get layout from DRAWINGVIEW g410.
-  (setq v_len   {v_len}
-        v_wid   {v_wid}
-        v_thk   {v_thk}
-        dim_gap 10.0
-        layout  "Sheet1")
+  (setq v_len           {v_len}
+        v_wid           {v_wid}
+        v_thk           {v_thk}
+        v_fillet        {v_fillet}
+        v_place_extrude {v_place_extrude}
+        v_place_fillet  {v_place_fillet}
+        dim_gap         10.0
+        layout          "Sheet1")
 
   ; ── Debug helpers ───────────────────────────────────────────────────────
   (setq _dbgf (open "{debug_path}" "w"))
   (defun _dbg (s) (write-line s _dbgf))
+
+  ; Fix groups 10 (dim-line definition point), 13/14 (ext line origins), 42
+  ; (measurement) on the last-placed dimension so snap errors don't matter.
+  ; Group 10 must be consistent with group 14 or AutoCAD suppresses ext line 2:
+  ;   vertical dim   → g10 = (dimline_x, o2.y, 0)
+  ;   horizontal dim → g10 = (o2.x, dimline_y, 0)
+  (defun _fixdim (o1 o2 g10 mval)
+    (setq _de (entlast))
+    (setq _dd (entget _de))
+    (if _dd
+      (progn
+        (if (assoc 10 _dd) (setq _dd (subst (cons 10 g10) (assoc 10 _dd) _dd)))
+        (if (assoc 13 _dd) (setq _dd (subst (cons 13 o1) (assoc 13 _dd) _dd)))
+        (if (assoc 14 _dd) (setq _dd (subst (cons 14 o2) (assoc 14 _dd) _dd)))
+        (if (assoc 42 _dd) (setq _dd (subst (cons 42 (float mval)) (assoc 42 _dd) _dd)))
+        (setq _emr (entmod _dd))
+        (entupd _de)
+        (_dbg (strcat "  _fixdim ok=" (vl-princ-to-string (not (not _emr)))
+                      " g10=" (vl-princ-to-string g10)
+                      " val=" (rtos mval 2 3)))
+      )
+      (_dbg "  _fixdim: entget nil")
+    )
+  )
 
   (_dbg "=== GhostForge DimAnnotate ===")
   (_dbg (strcat "CVPORT="    (vl-princ-to-string (getvar "CVPORT"))
@@ -424,33 +556,78 @@ _LISP_DIM = r'''
         (progn
           (_dbg "--- entmake failed, trying command _.DIMLINEAR ---")
 
-          ; Disable object snap so our exact bounding-box coords are used,
-          ; not snapped to fillet arc tangent points which shift the measurement.
-          (setq orig_osmode (getvar "OSMODE"))
-          (setvar "OSMODE" 0)
+          ; Pick extension line origins 0.5mm OUTSIDE the view bounding box.
+          ; No drawing geometry exists beyond the bbox, so Fusion snap has
+          ; nothing to grab — exact coordinates are used.
+          ; _T text override ensures model value regardless of measured distance.
 
-          ; Length — vertical (both pts share same X → DIMLINEAR auto-selects vertical)
-          (command "_.DIMLINEAR"
-            (list f_left f_top 0.0)
-            (list f_left f_bot 0.0)
-            (list (- f_left dim_gap) fy 0.0))
-          (_dbg "DIMLINEAR length placed")
+          ; Force both extension lines on before any DIMLINEAR — Dim-ISO-25
+          ; may have DIMSE1 or DIMSE2 set which would suppress one silently.
+          (if v_place_extrude
+            (progn
+              (_dbg (strcat "DIMSE1=" (vl-princ-to-string (getvar "DIMSE1"))
+                            "  DIMSE2=" (vl-princ-to-string (getvar "DIMSE2"))))
+              (setvar "DIMSE1" 0)
+              (setvar "DIMSE2" 0)
+              (_dbg (strcat "after setvar: DIMSE1=" (vl-princ-to-string (getvar "DIMSE1"))
+                            "  DIMSE2=" (vl-princ-to-string (getvar "DIMSE2"))))
 
-          ; Width — horizontal (both pts share same Y → auto-selects horizontal)
-          (command "_.DIMLINEAR"
-            (list f_left f_top 0.0)
-            (list f_right f_top 0.0)
-            (list fx (+ f_top dim_gap) 0.0))
-          (_dbg "DIMLINEAR width placed")
+              ; Length — vertical; initial picks establish vertical orientation.
+              ; _fixdim: g10 = (dimline_x, o2.y, 0) keeps ext line 2 horizontal.
+              (command "_.DIMLINEAR"
+                (list (- f_left 0.5) f_top 0.0)
+                (list (- f_left 0.5) f_bot 0.0)
+                (list (- f_left dim_gap) fy 0.0))
+              (_dbg "DIMLINEAR length placed")
+              (_fixdim (list f_left f_top 0.0) (list f_left f_bot 0.0)
+                       (list (- f_left dim_gap) f_bot 0.0) v_len)
 
-          ; Thickness — horizontal
-          (command "_.DIMLINEAR"
-            (list s_left s_top 0.0)
-            (list s_right s_top 0.0)
-            (list sx (+ s_top dim_gap) 0.0))
-          (_dbg "DIMLINEAR thickness placed")
+              ; Width — horizontal; g10 = (o2.x, dimline_y, 0).
+              (command "_.DIMLINEAR"
+                (list f_left (+ f_top 0.5) 0.0)
+                (list f_right (+ f_top 0.5) 0.0)
+                (list fx (+ f_top dim_gap) 0.0))
+              (_dbg "DIMLINEAR width placed")
+              (_fixdim (list f_left f_top 0.0) (list f_right f_top 0.0)
+                       (list f_right (+ f_top dim_gap) 0.0) v_wid)
 
-          (setvar "OSMODE" orig_osmode)
+              ; Thickness — horizontal; side view top edge.
+              (command "_.DIMLINEAR"
+                (list s_left (+ s_top 0.5) 0.0)
+                (list s_right (+ s_top 0.5) 0.0)
+                (list sx (+ s_top dim_gap) 0.0))
+              (_dbg "DIMLINEAR thickness placed")
+              (_fixdim (list s_left s_top 0.0) (list s_right s_top 0.0)
+                       (list s_right (+ s_top dim_gap) 0.0) v_thk)
+            )
+          )
+
+          ; ── Fillet radius dimension ─────────────────────────────────────
+          ; Arc geometry lives inside DRAWINGVIEW block defs — unreachable by
+          ; (entnext). Compute the top-right corner arc position from view geometry.
+          (if (and v_fillet v_place_fillet)
+            (progn
+              ; Top-right corner: arc centre is R inside the bbox corner
+              (setq _acx (- f_right (* v_fillet fscale))
+                    _acy (- f_top   (* v_fillet fscale))
+                    _ar  (* v_fillet fscale))
+              ; Pick at 45° from corner — point lies exactly on the arc surface
+              (setq _adx 0.7071  _ady 0.7071)
+              (setq _apx (+ _acx (* _ar _adx))
+                    _apy (+ _acy (* _ar _ady)))
+              (_dbg (strcat "DIMRADIUS pick=(" (rtos _apx 2 2) "," (rtos _apy 2 2)
+                            ") ctr=(" (rtos _acx 2 2) "," (rtos _acy 2 2) ")"))
+              (setvar "DIMSE1" 0) (setvar "DIMSE2" 0)
+              (command "_.DIMRADIUS"
+                (list _apx _apy 0.0)
+                (list (+ _acx (* (+ _ar dim_gap) _adx))
+                      (+ _acy (* (+ _ar dim_gap) _ady))
+                      0.0))
+              (_dbg "DIMRADIUS fired")
+            )
+          )
+
+          (command "_.REGEN")
           (_dbg "--- DIMLINEAR fallback done ---")
         )
       )
@@ -464,12 +641,16 @@ _LISP_DIM = r'''
 '''
 
 
-def _build_dim_scr(params, scr_path):
+def _build_dim_scr(params, fillet_r, scr_path, place_extrude=True, place_fillet=True):
     debug_path = _tmp('gf_dim_debug.txt').replace('\\', '/')
+    v_fillet_str = f'{fillet_r:.4f}' if fillet_r is not None else 'nil'
     lsp = _LISP_DIM.format(
         v_len=f'{params[0][1]:.4f}',
         v_wid=f'{params[1][1]:.4f}',
         v_thk=f'{params[2][1]:.4f}',
+        v_fillet=v_fillet_str,
+        v_place_extrude='T' if place_extrude else 'nil',
+        v_place_fillet='T'  if place_fillet  else 'nil',
         debug_path=debug_path,
     )
     with open(scr_path, 'w', encoding='ascii', errors='replace') as f:
@@ -486,9 +667,11 @@ class DACreatedHandler(adsk.core.CommandCreatedEventHandler):
                 info = '<b>No open design found.</b><br>Open the referenced design, then retry.'
             else:
                 params = collect_top3_lengths(design)
+                fillet_r = get_fillet_radius(design)
                 if len(params) < 3:
                     info = (f'<b>Only {len(params)} length parameter(s) found — need 3.</b><br>'
-                            'Ensure the design has sketch dimensions, an extrude, and a fillet.')
+                            'Ensure the design has sketch dimensions, an extrude, and a fillet.<br><br>'
+                            f'<small>{_diag_design(design)}</small>')
                 else:
                     info = (
                         '<b>Dim Annotate</b><br>'
@@ -528,20 +711,139 @@ class DADestroyHandler(adsk.core.CommandEventHandler):
             return
         params = collect_top3_lengths(design)
         if len(params) < 3:
-            ui.messageBox(f'Dim Annotate: need 3 length parameters, found {len(params)}.')
+            ui.messageBox(f'Dim Annotate: need 3 length parameters, found {len(params)}.\n'
+                          f'{_diag_design(design)}')
             return
+        fillet_r = get_fillet_radius(design)
         scr_path = _tmp('ghostforge_dims.scr')
-        _build_dim_scr(params, scr_path)
+        _build_dim_scr(params, fillet_r, scr_path)
         app.executeTextCommand(
             f'FusionDoc.ExecuteAcadCommand _.SCRIPT "{scr_path.replace(chr(92), "/")}"')
         debug_path = _tmp('gf_dim_debug.txt')
+        fillet_line = f'Fillet    : R{fillet_r:.1f} mm\n' if fillet_r is not None else 'Fillet    : not found\n'
         ui.messageBox(
             f'Dim Annotate ran.\n\n'
             f'Length    : {params[0][0]} = {params[0][1]:.1f} mm\n'
             f'Width     : {params[1][0]} = {params[1][1]:.1f} mm\n'
-            f'Thickness : {params[2][0]} = {params[2][1]:.1f} mm\n\n'
-            f'Check drawing for dims on layer GF_Dimensions.\n'
+            f'Thickness : {params[2][0]} = {params[2][1]:.1f} mm\n'
+            f'{fillet_line}\n'
             f'Debug log: {debug_path}')
+
+
+# ─── Dim Checklist ───────────────────────────────────────────────────────────
+
+class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
+    def notify(self, args):
+        try:
+            cmd    = args.command
+            inputs = cmd.commandInputs
+
+            design = find_open_design()
+            if not design:
+                inputs.addTextBoxCommandInput(
+                    'fc_info', '',
+                    '<b>No open design.</b><br>Open the referenced design first.',
+                    2, True)
+                return
+
+            features = collect_feature_list(design)
+            _pending['fc']['features'] = features
+
+            inputs.addTextBoxCommandInput(
+                'fc_desc', '',
+                '<b>Dim Checklist</b><br>'
+                'Select the features to annotate on the active drawing, then click OK.',
+                2, True)
+
+            table = inputs.addTableCommandInput('fc_table', 'Features', 3, '5:4:1')
+            table.hasGrid = True
+            table.minimumVisibleRows = min(max(len(features) + 1, 2), 6)
+            table.maximumVisibleRows = 10
+
+            def _hdr(col, text):
+                h = inputs.addTextBoxCommandInput(f'fch_{col}', '', f'<b>{text}</b>', 1, True)
+                table.addCommandInput(h, 0, col)
+
+            _hdr(0, 'Feature / Sketch')
+            _hdr(1, 'Parameters')
+            _hdr(2, 'Place?')
+
+            for i, feat in enumerate(features):
+                row = i + 1
+                n = inputs.addTextBoxCommandInput(f'fc_name_{i}',   '', feat['label'],      1, True)
+                p = inputs.addTextBoxCommandInput(f'fc_params_{i}', '', feat['params_str'], 1, True)
+                c = inputs.addBoolValueInput(f'fc_chk_{i}', '', True, '', True)
+                table.addCommandInput(n, row, 0)
+                table.addCommandInput(p, row, 1)
+                table.addCommandInput(c, row, 2)
+
+            h_ex = FCExecuteHandler()
+            h_ds = FCDestroyHandler()
+            cmd.execute.add(h_ex)
+            cmd.destroy.add(h_ds)
+            handlers.extend([h_ex, h_ds])
+        except Exception as e:
+            if ui:
+                ui.messageBox(f'Dim Checklist dialog error:\n{e}')
+
+
+class FCExecuteHandler(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        features = _pending['fc'].get('features', [])
+        inputs   = args.command.commandInputs
+        place_extrude = False
+        place_fillet  = False
+        for i, feat in enumerate(features):
+            chk = inputs.itemById(f'fc_chk_{i}')
+            if chk and chk.value:
+                if feat['type'] == 'extrude':
+                    place_extrude = True
+                elif feat['type'] == 'fillet':
+                    place_fillet = True
+        _pending['fc']['ok']            = True
+        _pending['fc']['place_extrude'] = place_extrude
+        _pending['fc']['place_fillet']  = place_fillet
+
+
+class FCDestroyHandler(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        if not _pending['fc'].pop('ok', False):
+            _pending['fc'].clear()
+            return
+        place_extrude = _pending['fc'].pop('place_extrude', False)
+        place_fillet  = _pending['fc'].pop('place_fillet',  False)
+        _pending['fc'].clear()
+        if not place_extrude and not place_fillet:
+            return
+        design = find_open_design()
+        if not design:
+            ui.messageBox('Dim Checklist: no open design.')
+            return
+        params = collect_top3_lengths(design)
+        if place_extrude and len(params) < 3:
+            ui.messageBox(f'Dim Checklist: need 3 length parameters, found {len(params)}.')
+            return
+        if not params:
+            params = [('?', 0.0), ('?', 0.0), ('?', 0.0)]
+        fillet_r  = get_fillet_radius(design)
+        scr_path  = _tmp('ghostforge_dims.scr')
+        _build_dim_scr(params, fillet_r, scr_path,
+                       place_extrude=place_extrude,
+                       place_fillet=place_fillet)
+        app.executeTextCommand(
+            f'FusionDoc.ExecuteAcadCommand _.SCRIPT "{scr_path.replace(chr(92), "/")}"')
+        debug_path = _tmp('gf_dim_debug.txt')
+        placed = []
+        if place_extrude:
+            placed.append(
+                f'Extrude: L={params[0][1]:.1f}, W={params[1][1]:.1f}, T={params[2][1]:.1f} mm')
+        if place_fillet and fillet_r is not None:
+            placed.append(f'Fillet:  R{fillet_r:.1f} mm')
+        elif place_fillet:
+            placed.append('Fillet:  (not found in design)')
+        ui.messageBox(
+            'Dim Checklist placed:\n  ' + '\n  '.join(placed) +
+            f'\n\nDebug log: {debug_path}')
 
 
 # ─── DWG Probe ───────────────────────────────────────────────────────────────
@@ -744,6 +1046,13 @@ def run(context):
             'from the open design. Run again after design changes to refresh.',
             DACreatedHandler,
             resource_folder=os.path.join(_RESOURCES, 'dim_icon'))
+
+        _add_cmd(
+            _get_or_create_panel(tab, GF_FC_PANEL, 'Checklist'),
+            CMD_FC, 'Dim Checklist',
+            'Feature checklist: select which features to annotate on the drawing. '
+            'Shows each feature with its associated sketch and parameters.',
+            FCCreatedHandler)
 
         _add_cmd(
             _get_or_create_panel(tab, GF_DP_PANEL, 'Probe'),
