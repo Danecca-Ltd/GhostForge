@@ -851,7 +851,7 @@ class FCDestroyHandler(adsk.core.CommandEventHandler):
 _DUMP_PATH = os.path.join(DESKTOP, 'ghostforge_probe.txt').replace('\\', '/')
 
 _LISP_PROBE = r'''
-(defun _gf_probe (/ f ent data etype cnt pt)
+(defun _gf_probe (/ f ent data etype cnt pt _pg)
   (setq f (open "{dump}" "w"))
   (defun _w (s) (write-line s f))
   (defun _g (code data / v) (setq v (cdr (assoc code data))) (if v (vl-princ-to-string v) "-"))
@@ -873,7 +873,13 @@ _LISP_PROBE = r'''
            (setq pt (cdr (assoc 10 data)))
            (if pt (_w (strcat "  defpt=" (rtos (car pt) 2 3) "," (rtos (cadr pt) 2 3)))))
           ((= etype "DRAWINGVIEW")
-           (_w "  (Fusion DRAWINGVIEW entity)"))
+           (_w "  [DRAWINGVIEW — all groups:]")
+           (setq _pg data)
+           (while _pg
+             (_w (strcat "    g" (itoa (caar _pg))
+                         " = " (vl-princ-to-string (cdar _pg))))
+             (setq _pg (cdr _pg))
+           ))
           ((= etype "INSERT")
            (_w (strcat "  BLOCK=" (_g 2 data))))
           ((= etype "VIEWPORT")
@@ -944,6 +950,127 @@ class DPDestroyHandler(adsk.core.CommandEventHandler):
             return
         results = []
 
+        # ── 1. Python Drawing API probe — runs first, own file, never overwritten ──
+        _api_path = os.path.join(DESKTOP, 'ghostforge_api_probe.txt')
+        api_summary = '?'
+        try:
+            with open(_api_path, 'w', encoding='utf-8') as fh:
+                def _aw(s): fh.write(s + '\n')
+                _aw('=== GhostForge Drawing API Probe ===')
+
+                # Discover what adsk.drawing exposes
+                _aw('--- adsk.drawing module attrs ---')
+                try:
+                    for a in sorted(x for x in dir(adsk.drawing) if not x.startswith('_')):
+                        _aw(f'  {a}')
+                except Exception as e:
+                    _aw(f'  dir ERR: {e}')
+
+                drawing_doc = adsk.drawing.DrawingDocument.cast(app.activeDocument)
+                if drawing_doc is None:
+                    _aw('DrawingDocument.cast -> None')
+                    api_summary = 'cast->None'
+                else:
+                    _aw(f'DrawingDocument cast OK: {drawing_doc.name}')
+                    api_summary = 'DrawingDoc OK'
+
+                    # Discover all attributes on the DrawingDocument instance
+                    _aw('--- DrawingDocument instance attrs ---')
+                    try:
+                        for a in sorted(x for x in dir(drawing_doc) if not x.startswith('_')):
+                            _aw(f'  {a}')
+                    except Exception as e:
+                        _aw(f'  dir ERR: {e}')
+
+                    # Go through drawing_doc.drawing (the Drawing object)
+                    _aw('--- drawing_doc.drawing ---')
+                    try:
+                        drawing = drawing_doc.drawing
+                        _aw(f'  drawing = {drawing!r}')
+                        _aw('  --- Drawing instance attrs ---')
+                        for a in sorted(x for x in dir(drawing) if not x.startswith('_')):
+                            _aw(f'    {a}')
+                        _aw('  --- Drawing attribute attempts ---')
+                        for attr in ('sheets', 'activeSheet', 'drawingViews',
+                                     'activeDrawingView', 'views', 'name'):
+                            try:
+                                val = getattr(drawing, attr)
+                                _aw(f'    {attr} = {val!r}')
+                                # If sheets, iterate it
+                                if attr == 'sheets':
+                                    try:
+                                        _aw(f'    sheets.count = {val.count}')
+                                        api_summary = f'sheets={val.count}'
+                                        for si in range(min(val.count, 2)):
+                                            sheet = val.item(si)
+                                            _aw(f'    Sheet[{si}]: {sheet.name!r}')
+                                            _aw(f'    Sheet[{si}] attrs: {[x for x in dir(sheet) if not x.startswith("_")]}')
+                                    except Exception as e2:
+                                        _aw(f'    sheets iterate ERR: {e2}')
+                            except AttributeError:
+                                _aw(f'    {attr}: no attr')
+                            except Exception as e:
+                                _aw(f'    {attr}: ERR {e}')
+                    except AttributeError:
+                        _aw('  drawing_doc.drawing: no attr')
+                        api_summary = 'no .drawing'
+                    except Exception as e:
+                        _aw(f'  drawing_doc.drawing ERR: {e}')
+                        api_summary = f'drawing ERR:{e}'
+
+                    # Probe activeSheet fully
+                    _aw('--- drawing.activeSheet ---')
+                    try:
+                        sheet = drawing_doc.drawing.activeSheet
+                        _aw(f'  activeSheet = {sheet!r}')
+                        _aw('  --- Sheet instance attrs ---')
+                        for a in sorted(x for x in dir(sheet) if not x.startswith('_')):
+                            _aw(f'    {a}')
+                        _aw('  --- Sheet attribute attempts ---')
+                        for attr in ('drawingViews', 'views', 'name', 'drawingViewDefinitions',
+                                     'background', 'height', 'width'):
+                            try:
+                                val = getattr(sheet, attr)
+                                _aw(f'    {attr} = {val!r}')
+                                if attr == 'drawingViews':
+                                    try:
+                                        _aw(f'    drawingViews.count = {val.count}')
+                                        api_summary = f'drawingViews={val.count}'
+                                        for vi in range(min(val.count, 12)):
+                                            v = val.item(vi)
+                                            parts = [f'    [{vi}]']
+                                            for vattr in ('name', 'viewType', 'scale',
+                                                          'drawingViewType', 'typeName'):
+                                                try:
+                                                    parts.append(f'{vattr}={getattr(v, vattr)!r}')
+                                                except Exception as ea:
+                                                    parts.append(f'{vattr}=N/A')
+                                            try:
+                                                pos = v.position
+                                                parts.append(f'pos=({pos.x:.1f},{pos.y:.1f})')
+                                            except Exception:
+                                                pass
+                                            _aw(' '.join(parts))
+                                    except Exception as e2:
+                                        _aw(f'    drawingViews iterate ERR: {e2}')
+                                        api_summary = f'drawingViews ERR:{e2}'
+                            except AttributeError:
+                                _aw(f'    {attr}: no attr')
+                            except Exception as e:
+                                _aw(f'    {attr}: ERR {e}')
+                    except Exception as e:
+                        _aw(f'  activeSheet ERR: {e}')
+
+                _aw('=== DONE ===')
+        except Exception as e:
+            api_summary = f'file-write-ERR:{e}'
+
+        # Summary at top so msgbox truncation can't hide it
+        results.append(f'API probe: {api_summary}')
+        results.append('  -> Desktop/ghostforge_api_probe.txt')
+        results.append('')
+
+        # ── 2. LISP entity dump (async — overwrites probe.txt after messagebox) ──
         try:
             lsp_path = _tmp('ghostforge_probe.lsp')
             scr_path = _tmp('ghostforge_probe.scr')
@@ -954,9 +1081,9 @@ class DPDestroyHandler(adsk.core.CommandEventHandler):
                 fh.write(f'(load "{lsp_path.replace(chr(92), "/")}")\n')
             app.executeTextCommand(
                 f'FusionDoc.ExecuteAcadCommand _.SCRIPT "{scr_path.replace(chr(92), "/")}"')
-            results.append('Dump → Desktop/ghostforge_probe.txt')
+            results.append('DWG dump -> Desktop/ghostforge_probe.txt')
         except Exception as e:
-            results.append(f'Dump ERR: {e}')
+            results.append(f'DWG dump ERR: {e}')
 
         results.append('')
         for label, cmd_str in _PROBE_TRIALS:
@@ -964,17 +1091,17 @@ class DPDestroyHandler(adsk.core.CommandEventHandler):
                 r = app.executeTextCommand(cmd_str)
                 results.append(f'OK  {label}')
                 if r:
-                    results.append(f'    → {r!r}')
+                    results.append(f'    -> {r!r}')
             except Exception as e:
                 results.append(f'ERR {label}')
-                results.append(f'    → {e}')
+                results.append(f'    -> {e}')
 
         ui.messageBox('DWG Probe\n\n' + '\n'.join(results))
 
 
 # ─── Panel management ─────────────────────────────────────────────────────────
 
-_ALL_CMD_IDS = (CMD_SKETCH, CMD_DIMS, CMD_PROBE)
+_ALL_CMD_IDS = (CMD_SKETCH, CMD_DIMS, CMD_FC, CMD_PROBE)
 
 
 def _cleanup_ui():
