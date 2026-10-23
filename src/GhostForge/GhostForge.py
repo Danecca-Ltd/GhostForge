@@ -229,6 +229,315 @@ def get_fillet_radius(design):
     return None
 
 
+# ─── Python Drawing API helpers ───────────────────────────────────────────────
+
+DIM_GAP  = 10.0  # mm offset from view bbox to first dim line
+DIM_STEP =  8.0  # mm between stacked dim lines (same view, same role)
+
+
+def find_open_drawing():
+    """Return the first open DrawingDocument, or None."""
+    for i in range(app.documents.count):
+        try:
+            doc = app.documents.item(i)
+            drawing = adsk.drawing.DrawingDocument.cast(doc)
+            if drawing is not None:
+                return drawing
+        except Exception:
+            continue
+    return None
+
+
+def _dp(x_mm, y_mm):
+    return adsk.drawing.DrawingPoint_create(adsk.core.Point2D.create(x_mm, y_mm))
+
+
+def _view_bbox(view):
+    """Return (x0, y0, x1, y1) in mm paper-space from view curves, or None."""
+    xs, ys = [], []
+    for ci in range(view.viewCurves.count):
+        c = view.viewCurves.item(ci)
+        for pt in (c.startPoint, c.endPoint):
+            try:
+                co = pt.coordinate
+                xs.append(co.x)
+                ys.append(co.y)
+            except Exception:
+                pass
+    return (min(xs), min(ys), max(xs), max(ys)) if xs else None
+
+
+def _clear_dims(drawing_doc):
+    """Delete all DrawingDimension objects on the active sheet."""
+    sheet   = drawing_doc.drawing.activeSheet
+    drawing = drawing_doc.drawing
+    coll    = adsk.core.ObjectCollection.create()
+    dims    = sheet.drawingDimensions
+    for i in range(dims.count):
+        coll.add(dims.item(i))
+    if coll.count > 0:
+        drawing.deleteEntities(coll)
+
+
+_ORI_NAMES = {0: 'Front', 1: 'Back', 2: 'Top', 3: 'Bottom',
+              4: 'Right', 5: 'Left', 6: 'IsoTR', 7: 'IsoTL', 8: 'IsoBR', 9: 'IsoBL'}
+
+
+def _enumerate_views(drawing_doc):
+    """Return list of view_info dicts for views eligible for dim placement."""
+    sheet  = drawing_doc.drawing.activeSheet
+    result = []
+    for i in range(sheet.views.count):
+        v  = sheet.views.item(i)
+        if v.type in (2, 3):  # skip Section, Detail
+            continue
+        bb = _view_bbox(v)
+        if bb is None:
+            continue
+        x0, y0, x1, y1 = bb
+        ori   = None
+        scale = 1.0
+        try:
+            ori = v.orientation
+        except Exception:
+            pass
+        try:
+            scale = float(v.scaleValue) if v.scaleValue else 1.0
+        except Exception:
+            pass
+        if v.type == 0 and ori is not None and ori in _ORI_NAMES:
+            label = f'{_ORI_NAMES[ori]} (Base)'
+        elif v.type == 0:
+            label = f'Base {i}'
+        else:
+            label = f'View {i} ({x1-x0:.0f}×{y1-y0:.0f}mm)'
+        result.append({
+            'idx': i, 'view': v, 'bbox': bb,
+            'cx': (x0 + x1) / 2, 'cy': (y0 + y1) / 2,
+            'w': x1 - x0, 'h': y1 - y0, 'label': label,
+            'scale': scale,
+        })
+    return result
+
+
+def _extreme_view_pts(view):
+    """Return the extreme ViewCurve startPoint/endPoint objects (actual curve points).
+
+    addLinearDimension requires start/end to be on view curves — DrawingPoint_create()
+    coordinates are rejected. We find the extreme curve endpoints in each direction.
+    Returns dict with keys min_x, max_x, min_y, max_y → DrawingPoint or None.
+    """
+    best = {'min_x': None, 'max_x': None, 'min_y': None, 'max_y': None}
+    vals = {'min_x': float('inf'), 'max_x': float('-inf'),
+            'min_y': float('inf'), 'max_y': float('-inf')}
+    for ci in range(view.viewCurves.count):
+        c = view.viewCurves.item(ci)
+        for pt in (c.startPoint, c.endPoint):
+            try:
+                co = pt.coordinate
+                if co.x < vals['min_x']:
+                    vals['min_x'] = co.x; best['min_x'] = pt
+                if co.x > vals['max_x']:
+                    vals['max_x'] = co.x; best['max_x'] = pt
+                if co.y < vals['min_y']:
+                    vals['min_y'] = co.y; best['min_y'] = pt
+                if co.y > vals['max_y']:
+                    vals['max_y'] = co.y; best['max_y'] = pt
+            except Exception:
+                pass
+    return best
+
+
+def _place_linear_dim(sheet, role, view_info, model_value_mm=None, slot=0):
+    """Place a linear dimension using actual ViewCurve endpoints as anchors.
+
+    addLinearDimension requires startPoint/endPoint to be on view curves.
+    L → vertical (y-extremes, left side),  W → horizontal (x-extremes, top).
+    slot offsets each subsequent dim in the same view away from the previous one.
+    textOverride is always applied when model_value_mm is given so the annotation
+    shows the model parameter value rather than the view geometry extent.
+    """
+    x0, y0, x1, y1 = view_info['bbox']
+    cx, cy  = view_info['cx'], view_info['cy']
+    scale   = view_info.get('scale', 1.0) or 1.0
+    dims    = sheet.drawingDimensions
+    pts     = _extreme_view_pts(view_info['view'])
+    placed  = None
+
+    if role == 'L':
+        dp1, dp2 = pts['min_y'], pts['max_y']
+        if dp1 is None or dp2 is None:
+            return
+        offset = x0 - DIM_GAP - slot * DIM_STEP
+        placed = dims.addLinearDimension(dp1, dp2, _dp(offset, cy))
+    elif role == 'W':
+        dp1, dp2 = pts['min_x'], pts['max_x']
+        if dp1 is None or dp2 is None:
+            return
+        offset = y1 + DIM_GAP + slot * DIM_STEP
+        placed = dims.addLinearDimension(dp1, dp2, _dp(cx, offset))
+    else:
+        return
+
+    if placed is not None and model_value_mm is not None:
+        try:
+            placed.textOverride = f'{model_value_mm:.2f}'
+        except Exception:
+            pass
+
+
+def _arc_scale(view_info):
+    return view_info.get('scale', 1.0) or 1.0
+
+
+def _place_radial_dim(sheet, view_info, target_r_mm):
+    """Find arc/circle in view and place a radial dim. Returns True on success."""
+    v     = view_info['view']
+    dims  = sheet.drawingDimensions
+    scale = _arc_scale(view_info)
+    for ci in range(v.viewCurves.count):
+        c = v.viewCurves.item(ci)
+        if c.type not in (1, 2):  # Arc=1, Circle=2
+            continue
+        try:
+            cp = c.centerPoint.coordinate
+            mp = c.midPoint.coordinate
+            r  = math.hypot(mp.x - cp.x, mp.y - cp.y)
+            if abs(r - target_r_mm * scale) > 0.5:
+                continue
+            dims.addRadialDimension(c, _dp(cp.x + r + DIM_GAP, cp.y))
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _place_diameter_dim(sheet, view_info, target_d_mm):
+    """Find arc/circle matching diameter target_d_mm and place Ø dim. Returns True."""
+    v     = view_info['view']
+    dims  = sheet.drawingDimensions
+    scale = _arc_scale(view_info)
+    target_r_mm = target_d_mm / 2.0
+    for ci in range(v.viewCurves.count):
+        c = v.viewCurves.item(ci)
+        if c.type not in (1, 2):  # Arc=1, Circle=2
+            continue
+        try:
+            cp = c.centerPoint.coordinate
+            mp = c.midPoint.coordinate
+            r  = math.hypot(mp.x - cp.x, mp.y - cp.y)
+            if abs(r - target_r_mm * scale) > 0.5:
+                continue
+            dims.addDiameterDimension(c, _dp(cp.x + r + DIM_GAP, cp.y))
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def collect_dim_list(design):
+    """Return ALL annotatable dimensions from the model (sketch dims, extrudes, fillets)."""
+    result  = []
+    seen    = set()
+
+    for comp in design.allComponents:
+        for sketch in comp.sketches:
+            for dim in sketch.sketchDimensions:
+                try:
+                    p = dim.parameter
+                    if p is None or p.name in seen:
+                        continue
+                    unit = (p.unit or '').strip()
+                    if unit in ('', 'ul', 'deg'):
+                        continue
+                    val = p.value * INTERNAL_TO_MM
+                    if val <= 0:
+                        continue
+                    seen.add(p.name)
+                    raw      = dim.classType().split('::')[-1]
+                    dim_type = _TYPE_MAP.get(raw, 'Lin')
+                    if raw == 'SketchRadialDimension':
+                        entry_type  = 'radial'
+                        entry_role  = 'R'
+                        entry_str   = f'R{val:.2f} mm'
+                    elif raw == 'SketchDiameterDimension':
+                        entry_type  = 'diameter'
+                        entry_role  = 'D'
+                        entry_str   = f'Ø{val:.2f} mm'   # Ø prefix
+                    else:
+                        entry_type  = 'linear'
+                        entry_role  = 'W'
+                        entry_str   = f'{val:.2f} mm'
+                    result.append({
+                        'id':         p.name,
+                        'type':       entry_type,
+                        'role':       entry_role,
+                        'label':      f'{p.name}  [{sketch.name} · {dim_type}]',
+                        'params_str': entry_str,
+                        'value':      val,
+                    })
+                except Exception:
+                    continue
+
+    for comp in design.allComponents:
+        for i in range(comp.features.extrudeFeatures.count):
+            try:
+                ef = comp.features.extrudeFeatures.item(i)
+                for side in ('extentOne', 'extentTwo'):
+                    try:
+                        dist = adsk.fusion.DistanceExtentDefinition.cast(getattr(ef, side))
+                        if dist:
+                            p = dist.distance
+                            if p and p.name not in seen:
+                                val = p.value * INTERNAL_TO_MM
+                                if val > 0:
+                                    seen.add(p.name)
+                                    result.append({
+                                        'id':         p.name,
+                                        'type':       'linear',
+                                        'role':       'L',
+                                        'label':      f'{p.name}  [Extrude · {ef.name}]',
+                                        'params_str': f'{val:.2f} mm',
+                                        'value':      val,
+                                    })
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    for comp in design.allComponents:
+        try:
+            for i in range(comp.features.filletFeatures.count):
+                feat = comp.features.filletFeatures.item(i)
+                r    = _fillet_radius_mm(feat)
+                if r is None:
+                    continue
+                fid = f'R_{feat.name}'
+                if fid in seen:
+                    continue
+                seen.add(fid)
+                edge_count = 0
+                try:
+                    for j in range(feat.edgeSets.count):
+                        edge_count += feat.edgeSets.item(j).edges.count
+                except Exception:
+                    pass
+                prefix = f'{edge_count}x ' if edge_count > 1 else ''
+                result.append({
+                    'id':         fid,
+                    'type':       'radial',
+                    'role':       'R',
+                    'label':      f'Fillet ({feat.name})',
+                    'params_str': f'{prefix}R{r:.2f} mm',
+                    'value':      r,
+                    'edge_count': edge_count,
+                })
+        except Exception:
+            pass
+
+    return result
+
+
 def collect_feature_list(design):
     """Return annotatable features with sketch associations for the checklist dialog."""
     result = []
@@ -705,7 +1014,8 @@ class DADestroyHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
         if not _pending['dims'].pop('ok', False):
             return
-        design = find_open_design()
+        design      = find_open_design()
+        drawing_doc = find_open_drawing()
         if not design:
             ui.messageBox('Dim Annotate: no open design.')
             return
@@ -715,19 +1025,46 @@ class DADestroyHandler(adsk.core.CommandEventHandler):
                           f'{_diag_design(design)}')
             return
         fillet_r = get_fillet_radius(design)
-        scr_path = _tmp('ghostforge_dims.scr')
-        _build_dim_scr(params, fillet_r, scr_path)
-        app.executeTextCommand(
-            f'FusionDoc.ExecuteAcadCommand _.SCRIPT "{scr_path.replace(chr(92), "/")}"')
-        debug_path = _tmp('gf_dim_debug.txt')
+
+        if not drawing_doc:
+            # LISP fallback
+            scr_path = _tmp('ghostforge_dims.scr')
+            _build_dim_scr(params, fillet_r, scr_path)
+            app.executeTextCommand(
+                f'FusionDoc.ExecuteAcadCommand _.SCRIPT "{scr_path.replace(chr(92), "/")}"')
+            ui.messageBox('Dim Annotate (LISP fallback — no drawing document found).\n'
+                          f'Debug log: {_tmp("gf_dim_debug.txt")}')
+            return
+
+        views = _enumerate_views(drawing_doc)
+        if not views:
+            ui.messageBox('Dim Annotate: no eligible views on active sheet.')
+            return
+
+        _clear_dims(drawing_doc)
+        sheet    = drawing_doc.drawing.activeSheet
+        dims_lst = collect_dim_list(design)
+        placed   = []
+        for dim in dims_lst:
+            vi = views[0]
+            try:
+                if dim['type'] == 'linear':
+                    _place_linear_dim(sheet, dim['role'], vi)
+                    placed.append(dim['label'])
+                elif dim['type'] == 'radial' and fillet_r is not None:
+                    if _place_radial_dim(sheet, vi, dim['value']):
+                        placed.append(dim['label'])
+            except Exception as e:
+                placed.append(f"{dim['label']} ERR: {e}")
+
         fillet_line = f'Fillet    : R{fillet_r:.1f} mm\n' if fillet_r is not None else 'Fillet    : not found\n'
         ui.messageBox(
-            f'Dim Annotate ran.\n\n'
+            f'Dim Annotate complete.\n\n'
             f'Length    : {params[0][0]} = {params[0][1]:.1f} mm\n'
             f'Width     : {params[1][0]} = {params[1][1]:.1f} mm\n'
             f'Thickness : {params[2][0]} = {params[2][1]:.1f} mm\n'
-            f'{fillet_line}\n'
-            f'Debug log: {debug_path}')
+            f'{fillet_line}'
+            f'\nPlaced: {len(placed)} dim(s)')
 
 
 # ─── Dim Checklist ───────────────────────────────────────────────────────────
@@ -738,7 +1075,8 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
             cmd    = args.command
             inputs = cmd.commandInputs
 
-            design = find_open_design()
+            design      = find_open_design()
+            drawing_doc = find_open_drawing()
             if not design:
                 inputs.addTextBoxCommandInput(
                     'fc_info', '',
@@ -746,36 +1084,49 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     2, True)
                 return
 
-            features = collect_feature_list(design)
-            _pending['fc']['features'] = features
+            dims_list = collect_dim_list(design)
+            views     = _enumerate_views(drawing_doc) if drawing_doc else []
+            _pending['fc']['dims_list'] = dims_list
+            _pending['fc']['views']     = views
 
+            no_drawing = '' if drawing_doc else '<br><i>No drawing open — dims will be skipped.</i>'
             inputs.addTextBoxCommandInput(
                 'fc_desc', '',
                 '<b>Dim Checklist</b><br>'
-                'Select the features to annotate on the active drawing, then click OK.',
-                2, True)
+                'Select the view for each dimension, then click OK. '
+                'Existing dims on the sheet are cleared and replaced. '
+                'Linear dims show the view geometry extent (scale-corrected); '
+                'R/Ø dims match arcs in the view.' + no_drawing,
+                4, True)
 
-            table = inputs.addTableCommandInput('fc_table', 'Features', 3, '5:4:1')
+            table = inputs.addTableCommandInput('fc_table', 'Dimensions', 3, '4:2:4')
             table.hasGrid = True
-            table.minimumVisibleRows = min(max(len(features) + 1, 2), 6)
-            table.maximumVisibleRows = 10
+            table.maximumVisibleRows = 12
+            table.minimumVisibleRows = min(max(len(dims_list) + 1, 2), 6)
 
             def _hdr(col, text):
                 h = inputs.addTextBoxCommandInput(f'fch_{col}', '', f'<b>{text}</b>', 1, True)
                 table.addCommandInput(h, 0, col)
 
-            _hdr(0, 'Feature / Sketch')
-            _hdr(1, 'Parameters')
-            _hdr(2, 'Place?')
+            _hdr(0, 'Dimension')
+            _hdr(1, 'Value')
+            _hdr(2, 'View')
 
-            for i, feat in enumerate(features):
+            view_labels = ['(skip)'] + [v['label'] for v in views]
+
+            for i, dim in enumerate(dims_list):
                 row = i + 1
-                n = inputs.addTextBoxCommandInput(f'fc_name_{i}',   '', feat['label'],      1, True)
-                p = inputs.addTextBoxCommandInput(f'fc_params_{i}', '', feat['params_str'], 1, True)
-                c = inputs.addBoolValueInput(f'fc_chk_{i}', '', True, '', True)
-                table.addCommandInput(n, row, 0)
-                table.addCommandInput(p, row, 1)
-                table.addCommandInput(c, row, 2)
+                n  = inputs.addTextBoxCommandInput(f'fc_name_{i}', '', dim['label'],      1, True)
+                p  = inputs.addTextBoxCommandInput(f'fc_val_{i}',  '', dim['params_str'], 1, True)
+                dd = inputs.addDropDownCommandInput(
+                    f'fc_view_{i}', '', adsk.core.DropDownStyles.TextListDropDownStyle)
+                for j, lbl in enumerate(view_labels):
+                    # First view when views exist, else skip — works for all dim types
+                    default_sel = (j == 1 and bool(views)) or (j == 0 and not views)
+                    dd.listItems.add(lbl, bool(default_sel))
+                table.addCommandInput(n,  row, 0)
+                table.addCommandInput(p,  row, 1)
+                table.addCommandInput(dd, row, 2)
 
             h_ex = FCExecuteHandler()
             h_ds = FCDestroyHandler()
@@ -789,20 +1140,18 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
 
 class FCExecuteHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
-        features = _pending['fc'].get('features', [])
-        inputs   = args.command.commandInputs
-        place_extrude = False
-        place_fillet  = False
-        for i, feat in enumerate(features):
-            chk = inputs.itemById(f'fc_chk_{i}')
-            if chk and chk.value:
-                if feat['type'] == 'extrude':
-                    place_extrude = True
-                elif feat['type'] == 'fillet':
-                    place_fillet = True
-        _pending['fc']['ok']            = True
-        _pending['fc']['place_extrude'] = place_extrude
-        _pending['fc']['place_fillet']  = place_fillet
+        dims_list = _pending['fc'].get('dims_list', [])
+        inputs    = args.command.commandInputs
+        assignments = []
+        for i in range(len(dims_list)):
+            dd = inputs.itemById(f'fc_view_{i}')
+            if dd and dd.selectedItem:
+                sel = dd.selectedItem.index  # 0=(skip), 1+=view index
+                assignments.append(sel - 1 if sel > 0 else None)
+            else:
+                assignments.append(None)
+        _pending['fc']['ok']          = True
+        _pending['fc']['assignments'] = assignments
 
 
 class FCDestroyHandler(adsk.core.CommandEventHandler):
@@ -810,40 +1159,51 @@ class FCDestroyHandler(adsk.core.CommandEventHandler):
         if not _pending['fc'].pop('ok', False):
             _pending['fc'].clear()
             return
-        place_extrude = _pending['fc'].pop('place_extrude', False)
-        place_fillet  = _pending['fc'].pop('place_fillet',  False)
+        assignments = _pending['fc'].pop('assignments', [])
+        dims_list   = _pending['fc'].pop('dims_list',   [])
+        views       = _pending['fc'].pop('views',       [])
         _pending['fc'].clear()
-        if not place_extrude and not place_fillet:
+
+        design      = find_open_design()
+        drawing_doc = find_open_drawing()
+        if not design or not drawing_doc:
+            ui.messageBox('Dim Checklist: no open design or drawing document.')
             return
-        design = find_open_design()
-        if not design:
-            ui.messageBox('Dim Checklist: no open design.')
-            return
-        params = collect_top3_lengths(design)
-        if place_extrude and len(params) < 3:
-            ui.messageBox(f'Dim Checklist: need 3 length parameters, found {len(params)}.')
-            return
-        if not params:
-            params = [('?', 0.0), ('?', 0.0), ('?', 0.0)]
-        fillet_r  = get_fillet_radius(design)
-        scr_path  = _tmp('ghostforge_dims.scr')
-        _build_dim_scr(params, fillet_r, scr_path,
-                       place_extrude=place_extrude,
-                       place_fillet=place_fillet)
-        app.executeTextCommand(
-            f'FusionDoc.ExecuteAcadCommand _.SCRIPT "{scr_path.replace(chr(92), "/")}"')
-        debug_path = _tmp('gf_dim_debug.txt')
+
+        _clear_dims(drawing_doc)
+        sheet  = drawing_doc.drawing.activeSheet
         placed = []
-        if place_extrude:
-            placed.append(
-                f'Extrude: L={params[0][1]:.1f}, W={params[1][1]:.1f}, T={params[2][1]:.1f} mm')
-        if place_fillet and fillet_r is not None:
-            placed.append(f'Fillet:  R{fillet_r:.1f} mm')
-        elif place_fillet:
-            placed.append('Fillet:  (not found in design)')
-        ui.messageBox(
-            'Dim Checklist placed:\n  ' + '\n  '.join(placed) +
-            f'\n\nDebug log: {debug_path}')
+        errors = []
+        slots  = {}   # (view_idx, role) → next slot index for stagger
+
+        for dim, view_idx in zip(dims_list, assignments):
+            if view_idx is None or view_idx >= len(views):
+                continue
+            vi = views[view_idx]
+            try:
+                if dim['type'] == 'linear':
+                    key  = (view_idx, dim['role'])
+                    slot = slots.get(key, 0)
+                    slots[key] = slot + 1
+                    _place_linear_dim(sheet, dim['role'], vi, dim['value'], slot=slot)
+                    placed.append(f"{dim['label']}: {dim['params_str']} → {vi['label']}")
+                elif dim['type'] == 'radial':
+                    if _place_radial_dim(sheet, vi, dim['value']):
+                        placed.append(f"{dim['label']}: {dim['params_str']} → {vi['label']}")
+                    else:
+                        errors.append(f"R{dim['value']:.2f}: no matching arc in {vi['label']}")
+                elif dim['type'] == 'diameter':
+                    if _place_diameter_dim(sheet, vi, dim['value']):
+                        placed.append(f"{dim['label']}: {dim['params_str']} → {vi['label']}")
+                    else:
+                        errors.append(f"Ø{dim['value']:.2f}: no matching arc in {vi['label']}")
+            except Exception as e:
+                errors.append(f"{dim['label']}: {e}")
+
+        msg = ('Placed:\n  ' + '\n  '.join(placed)) if placed else 'Nothing placed.'
+        if errors:
+            msg += '\n\nIssues:\n  ' + '\n  '.join(errors)
+        ui.messageBox(msg)
 
 
 # ─── DWG Probe ───────────────────────────────────────────────────────────────
@@ -901,8 +1261,6 @@ _LISP_PROBE = r'''
 '''
 
 _PROBE_TRIALS = [
-    ('InvokeDrawingCmdById FusionDrawingSingleDimensionCmd',
-     'FusionDoc.InvokeDrawingCmdById FusionDrawingSingleDimensionCmd'),
     ('SetCursorPos 142 180',
      'FusionDoc.SetCursorPos 142 180'),
     ('Click',
@@ -925,8 +1283,8 @@ class DPCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 'info', '',
                 '<b>DWG Probe</b><br>'
                 'Dumps the DWG entity database via AutoLISP and probes '
-                'InvokeDrawingCmdById + click simulation commands.<br><br>'
-                'Output: <tt>Desktop/ghostforge_probe.txt</tt><br>'
+                'the Python drawing API (views, dims, live call signatures).<br><br>'
+                'Output: <tt>Desktop/ghostforge_api_probe.txt</tt><br>'
                 'Open a drawing with at least one view before running.',
                 6, True)
             h_ex = DPExecuteHandler()
@@ -1123,10 +1481,329 @@ class DPDestroyHandler(adsk.core.CommandEventHandler):
                 except Exception as e:
                     _aw(f'  ViewOrientationTypes ERR: {e}')
 
+                # ── Drawing Sketches ──
+                _aw('--- sheet.sketches ---')
+                try:
+                    sheet2 = drawing_doc.drawing.activeSheet
+                    sketches = sheet2.sketches
+                    _aw(f'  sketches = {sketches!r}')
+                    _aw(f'  sketches.count = {sketches.count}')
+                    _aw(f'  DrawingSketches dir: {[x for x in dir(sketches) if not x.startswith("_")]}')
+                    if sketches.count > 0:
+                        sk = sketches.item(0)
+                        _aw(f'  sketch[0] = {sk!r}')
+                        _aw(f'  sketch[0] dir: {[x for x in dir(sk) if not x.startswith("_")]}')
+                        for attr in ('lines', 'arcs', 'circles', 'ellipses', 'rectangles',
+                                     'sketchLines', 'sketchArcs', 'sketchTexts',
+                                     'texts', 'annotations', 'entities',
+                                     'name', 'isVisible'):
+                            try:
+                                val = getattr(sk, attr)
+                                _aw(f'    sketch[0].{attr} = {val!r}')
+                                try:
+                                    _aw(f'      .count = {val.count}')
+                                    if val.count > 0:
+                                        first = val.item(0)
+                                        _aw(f'      [0] dir: {[x for x in dir(first) if not x.startswith("_")]}')
+                                except Exception:
+                                    pass
+                            except AttributeError:
+                                _aw(f'    sketch[0].{attr}: no attr')
+                            except Exception as e:
+                                _aw(f'    sketch[0].{attr}: ERR {e}')
+                    else:
+                        _aw('  (no sketches on sheet — trying add())')
+                        try:
+                            add_attrs = [x for x in dir(sketches) if 'add' in x.lower()]
+                            _aw(f'  add-related attrs: {add_attrs}')
+                        except Exception as e:
+                            _aw(f'  add attr scan ERR: {e}')
+                except Exception as e:
+                    _aw(f'  sheet.sketches ERR: {e}')
+
+                # ── DrawingDimensions method signatures via help() ──
+                _aw('--- drawingDimensions method signatures ---')
+                try:
+                    import io
+                    sheet4 = drawing_doc.drawing.activeSheet
+                    dims4  = sheet4.drawingDimensions
+                    for method_name in ('addLinearDimension', 'addRadialDimension',
+                                        'addAngularDimension', 'addDiameterDimension',
+                                        'addArcLengthDimension', 'addJoggedRadiusDimension'):
+                        try:
+                            method = getattr(dims4, method_name)
+                            buf = io.StringIO()
+                            import sys
+                            old_stdout = sys.stdout
+                            sys.stdout = buf
+                            try:
+                                help(method)
+                            finally:
+                                sys.stdout = old_stdout
+                            _aw(f'  {method_name}:')
+                            for line in buf.getvalue().splitlines():
+                                _aw(f'    {line}')
+                        except Exception as em:
+                            _aw(f'  {method_name} help ERR: {em}')
+                            try:
+                                _aw(f'  {method_name}.__doc__ = {getattr(dims4, method_name).__doc__!r}')
+                            except Exception:
+                                pass
+                except Exception as e:
+                    _aw(f'  signatures ERR: {e}')
+
+                # ── DrawingSketches.add signature ──
+                _aw('--- DrawingSketches.add signature ---')
+                try:
+                    sheet5 = drawing_doc.drawing.activeSheet
+                    sk5    = sheet5.sketches
+                    buf = io.StringIO()
+                    old_stdout = sys.stdout
+                    sys.stdout = buf
+                    try:
+                        help(sk5.add)
+                    finally:
+                        sys.stdout = old_stdout
+                    for line in buf.getvalue().splitlines():
+                        _aw(f'  {line}')
+                except Exception as e:
+                    _aw(f'  sketches.add help ERR: {e}')
+
+                # ── Drawing Dimensions (read existing) ──
+                _aw('--- sheet.drawingDimensions ---')
+                try:
+                    sheet3 = drawing_doc.drawing.activeSheet
+                    dims = sheet3.drawingDimensions
+                    _aw(f'  drawingDimensions = {dims!r}')
+                    _aw(f'  drawingDimensions.count = {dims.count}')
+                    _aw(f'  DrawingDimensions dir: {[x for x in dir(dims) if not x.startswith("_")]}')
+                    if dims.count > 0:
+                        d = dims.item(0)
+                        _aw(f'  dim[0] dir: {[x for x in dir(d) if not x.startswith("_")]}')
+                        for attr in ('value', 'text', 'type', 'dimensionType',
+                                     'position', 'origin', 'startPoint', 'endPoint',
+                                     'isAssociated', 'view'):
+                            try:
+                                val = getattr(d, attr)
+                                _aw(f'    dim[0].{attr} = {val!r}')
+                            except AttributeError:
+                                _aw(f'    dim[0].{attr}: no attr')
+                            except Exception as e:
+                                _aw(f'    dim[0].{attr}: ERR {e}')
+                    else:
+                        _aw('  (no dims on sheet — trying add-related attrs)')
+                        add_attrs = [x for x in dir(dims) if 'add' in x.lower()]
+                        _aw(f'  add-related attrs: {add_attrs}')
+                except Exception as e:
+                    _aw(f'  sheet.drawingDimensions ERR: {e}')
+
+                # ── Live call probe — TypeError messages reveal exact signatures ──
+                _aw('--- Live call probe (TypeError -> signature) ---')
+                try:
+                    sheet6 = drawing_doc.drawing.activeSheet
+                    dims6  = sheet6.drawingDimensions
+                    views6 = sheet6.views
+
+                    # DrawingPoint_create — try no-args then (x, y)
+                    pt_ok = None
+                    for pt_args in [(), (0.0, 0.0)]:
+                        try:
+                            pt_ok = adsk.drawing.DrawingPoint_create(*pt_args)
+                            _aw(f'  DrawingPoint_create{pt_args} -> OK {pt_ok!r}')
+                            _aw(f'    dir: {[x for x in dir(pt_ok) if not x.startswith("_")]}')
+                            break
+                        except Exception as e:
+                            _aw(f'  DrawingPoint_create{pt_args} -> {type(e).__name__}: {e}')
+
+                    # addLinearDimension / addRadialDimension with no args
+                    for mname in ('addLinearDimension', 'addRadialDimension',
+                                  'addDiameterDimension'):
+                        try:
+                            getattr(dims6, mname)()
+                        except Exception as e:
+                            _aw(f'  {mname}() -> {type(e).__name__}: {e}')
+
+                    if views6.count > 0:
+                        v0 = views6.item(0)
+                        vc = v0.viewCurves
+                        _aw(f'  view[0] type={v0.type}  viewCurves.count={vc.count}')
+                        if vc.count > 0:
+                            c0 = vc.item(0)
+                            _aw(f'  viewCurve[0] dir: {[x for x in dir(c0) if not x.startswith("_")]}')
+                            # Try addLinearDimension with plausible arg combos
+                            for sig_args, sig_label in [
+                                ((v0, c0, c0, pt_ok), 'view,curve,curve,point'),
+                                ((c0, c0, pt_ok),     'curve,curve,point'),
+                                ((v0, c0, c0),        'view,curve,curve'),
+                            ]:
+                                if None in sig_args:
+                                    continue
+                                try:
+                                    dims6.addLinearDimension(*sig_args)
+                                    _aw(f'  addLinearDimension({sig_label}) -> OK!')
+                                except Exception as e:
+                                    _aw(f'  addLinearDimension({sig_label}) -> {type(e).__name__}: {e}')
+                            # Try addRadialDimension
+                            for sig_args, sig_label in [
+                                ((v0, c0, pt_ok), 'view,curve,point'),
+                                ((c0, pt_ok),     'curve,point'),
+                                ((v0, c0),        'view,curve'),
+                            ]:
+                                if None in sig_args:
+                                    continue
+                                try:
+                                    dims6.addRadialDimension(*sig_args)
+                                    _aw(f'  addRadialDimension({sig_label}) -> OK!')
+                                except Exception as e:
+                                    _aw(f'  addRadialDimension({sig_label}) -> {type(e).__name__}: {e}')
+                except Exception as e:
+                    _aw(f'  live probe ERR: {e}')
+
+                # ── ViewCurveTypes enum ──
+                _aw('--- ViewCurveTypes enum ---')
+                try:
+                    vct = adsk.drawing.ViewCurveTypes
+                    for name in sorted(x for x in dir(vct) if not x.startswith('_')):
+                        try:
+                            _aw(f'  ViewCurveTypes.{name} = {getattr(vct, name)!r}')
+                        except Exception:
+                            pass
+                except Exception as e:
+                    _aw(f'  ViewCurveTypes ERR: {e}')
+
+                # ── ViewCurve geometry — per-curve attrs across all views ──
+                _aw('--- ViewCurve geometry per view ---')
+                try:
+                    sheet7 = drawing_doc.drawing.activeSheet
+                    for vi in range(sheet7.views.count):
+                        v7  = sheet7.views.item(vi)
+                        vc7 = v7.viewCurves
+                        _aw(f'  view[{vi}] type={v7.type} curves={vc7.count}')
+                        arcs_found = 0
+                        for ci in range(min(vc7.count, 60)):
+                            c = vc7.item(ci)
+                            row = [f'    [{ci}]']
+                            for attr in ('type', 'curveType'):
+                                try:
+                                    row.append(f'{attr}={getattr(c, attr)!r}')
+                                except Exception:
+                                    pass
+                            # Geometry per curve type
+                            for attr in ('startPoint', 'endPoint',        # lines
+                                         'center', 'radius',               # arcs/circles
+                                         'startAngle', 'endAngle',         # arcs
+                                         'geometry', 'worldGeometry'):     # generic
+                                try:
+                                    val = getattr(c, attr)
+                                    if hasattr(val, 'x'):
+                                        row.append(f'{attr}=({val.x:.2f},{val.y:.2f})')
+                                    else:
+                                        row.append(f'{attr}={val!r}')
+                                except AttributeError:
+                                    pass
+                                except Exception as e:
+                                    row.append(f'{attr}=ERR:{e}')
+                            _aw(' '.join(row))
+                            # Full dir on first curve of each view
+                            if ci == 0:
+                                _aw(f'      dir: {[x for x in dir(c) if not x.startswith("_")]}')
+                except Exception as e:
+                    _aw(f'  ViewCurve geometry ERR: {e}')
+
+                # ── isModified baseline (must come before any new sections) ──
+                _mod_baseline = drawing_doc.isModified
+                _aw(f'--- isModified baseline: {_mod_baseline} ---')
+
+                def _check_modified(label):
+                    now = drawing_doc.isModified
+                    if now != _mod_baseline:
+                        _aw(f'  *** DOCUMENT MODIFIED after: {label} ***')
+
+                # ── DrawingPoint.coordinate.x/.y — the one remaining unknown ──
+                _aw('--- DrawingPoint.coordinate.x/.y ---')
+                try:
+                    _sheet_coord = drawing_doc.drawing.activeSheet
+                    for _vi in range(_sheet_coord.views.count):
+                        _v = _sheet_coord.views.item(_vi)
+                        if _v.viewCurves.count == 0:
+                            continue
+                        _c = _v.viewCurves.item(0)
+                        _sp = _c.startPoint
+                        _ep = _c.endPoint
+                        _co = _sp.coordinate
+                        _aw(f'  view[{_vi}] type={_v.type} curve[0] type={_c.type}')
+                        _aw(f'    startPoint.coordinate type={type(_co).__name__}')
+                        _aw(f'    coord dir: {[x for x in dir(_co) if not x.startswith("_")]}')
+                        for _attr in ('x', 'y', 'z', 'asArray'):
+                            try:
+                                _val = getattr(_co, _attr)
+                                if callable(_val):
+                                    _aw(f'    coord.{_attr}() = {_val()!r}')
+                                else:
+                                    _aw(f'    coord.{_attr} = {_val!r}')
+                            except Exception as _ae:
+                                _aw(f'    coord.{_attr}: ERR {_ae}')
+                        # Same for endPoint
+                        _eco = _ep.coordinate
+                        for _attr in ('x', 'y'):
+                            try:
+                                _aw(f'    endPoint.coord.{_attr} = {getattr(_eco, _attr)!r}')
+                            except Exception as _ae:
+                                _aw(f'    endPoint.coord.{_attr}: ERR {_ae}')
+                        break  # only need one view
+                    _check_modified('coordinate read')
+                except Exception as _e:
+                    _aw(f'  coordinate ERR: {_e}')
+
+                # ── Per-view bounding boxes using .coordinate ──
+                _aw('--- Per-view bounding boxes (coordinate) ---')
+                try:
+                    _sheet_bbox = drawing_doc.drawing.activeSheet
+                    for _vi in range(_sheet_bbox.views.count):
+                        _v = _sheet_bbox.views.item(_vi)
+                        _xs, _ys = [], []
+                        for _ci in range(_v.viewCurves.count):
+                            _c = _v.viewCurves.item(_ci)
+                            for _pt in (_c.startPoint, _c.endPoint):
+                                try:
+                                    _co = _pt.coordinate
+                                    _xs.append(_co.x)
+                                    _ys.append(_co.y)
+                                except Exception:
+                                    pass
+                        if _xs:
+                            _aw(f'  view[{_vi}] type={_v.type}'
+                                f' x={min(_xs):.3f}..{max(_xs):.3f}'
+                                f' y={min(_ys):.3f}..{max(_ys):.3f}'
+                                f' w={max(_xs)-min(_xs):.3f}'
+                                f' h={max(_ys)-min(_ys):.3f}')
+                        else:
+                            _aw(f'  view[{_vi}] type={_v.type}: no coords')
+                    _check_modified('bounding box')
+                except Exception as _e:
+                    _aw(f'  bbox ERR: {_e}')
+
+                # ── DrawingPoint_create(Point2D) coordinate round-trip ──
+                _aw('--- DrawingPoint_create coordinate round-trip ---')
+                try:
+                    _pt2d = adsk.core.Point2D.create(12.34, 56.78)
+                    _dp   = adsk.drawing.DrawingPoint_create(_pt2d)
+                    _co   = _dp.coordinate
+                    _aw(f'  DrawingPoint_create(Point2D(12.34, 56.78)):')
+                    _aw(f'    .coordinate type = {type(_co).__name__}')
+                    for _attr in ('x', 'y'):
+                        try:
+                            _aw(f'    .coordinate.{_attr} = {getattr(_co, _attr)!r}')
+                        except Exception as _ae:
+                            _aw(f'    .coordinate.{_attr}: ERR {_ae}')
+                    _check_modified('DrawingPoint_create')
+                except Exception as _e:
+                    _aw(f'  round-trip ERR: {_e}')
+
+                _aw(f'--- isModified final: {drawing_doc.isModified} ---')
                 _aw('=== DONE ===')
         except Exception as e:
             api_summary = f'file-write-ERR:{e}'
-
         # Summary at top so msgbox truncation can't hide it
         results.append(f'API probe: {api_summary}')
         results.append('  -> Desktop/ghostforge_api_probe.txt')
@@ -1205,8 +1882,14 @@ def _add_cmd(panel, cmd_id, name, tooltip, created_cls, resource_folder=''):
     h = created_cls()
     cmd_def.commandCreated.add(h)
     handlers.append(h)
+    try:
+        stale = panel.controls.itemById(cmd_id)
+        if stale:
+            stale.deleteMe()
+    except Exception:
+        pass
     ctrl = panel.controls.addCommand(cmd_def)
-    ctrl.isPromoted         = True
+    ctrl.isPromoted          = True
     ctrl.isPromotedByDefault = True
 
 
@@ -1241,7 +1924,8 @@ def run(context):
             CMD_FC, 'Dim Checklist',
             'Feature checklist: select which features to annotate on the drawing. '
             'Shows each feature with its associated sketch and parameters.',
-            FCCreatedHandler)
+            FCCreatedHandler,
+            resource_folder=os.path.join(_RESOURCES, 'fc_icon'))
 
         _add_cmd(
             _get_or_create_panel(tab, GF_DP_PANEL, 'Probe'),
