@@ -1032,18 +1032,19 @@ class DPDestroyHandler(adsk.core.CommandEventHandler):
                             try:
                                 val = getattr(sheet, attr)
                                 _aw(f'    {attr} = {val!r}')
-                                if attr == 'drawingViews':
+                                if attr in ('drawingViews', 'views'):
                                     try:
-                                        _aw(f'    drawingViews.count = {val.count}')
-                                        api_summary = f'drawingViews={val.count}'
+                                        _aw(f'    {attr}.count = {val.count}')
+                                        api_summary = f'{attr}={val.count} (NEW API!)'
                                         for vi in range(min(val.count, 12)):
                                             v = val.item(vi)
                                             parts = [f'    [{vi}]']
-                                            for vattr in ('name', 'viewType', 'scale',
-                                                          'drawingViewType', 'typeName'):
+                                            for vattr in ('name', 'type', 'scaleValue',
+                                                          'viewType', 'drawingViewType',
+                                                          'typeName', 'scale'):
                                                 try:
                                                     parts.append(f'{vattr}={getattr(v, vattr)!r}')
-                                                except Exception as ea:
+                                                except Exception:
                                                     parts.append(f'{vattr}=N/A')
                                             try:
                                                 pos = v.position
@@ -1051,15 +1052,76 @@ class DPDestroyHandler(adsk.core.CommandEventHandler):
                                             except Exception:
                                                 pass
                                             _aw(' '.join(parts))
+                                            # Probe orientation and viewCurves count
+                                            try:
+                                                ori = v.orientation
+                                                _aw(f'      orientation = {ori!r}  type={type(ori).__name__}')
+                                            except Exception as eo:
+                                                _aw(f'      orientation ERR: {eo}')
+                                            try:
+                                                vc = v.viewCurves
+                                                _aw(f'      viewCurves.count = {vc.count}')
+                                            except Exception as evc:
+                                                _aw(f'      viewCurves ERR: {evc}')
+                                            # Also dump all attrs on first view
+                                            if vi == 0:
+                                                try:
+                                                    _aw(f'      (View[0] full dir: {[x for x in dir(v) if not x.startswith("_")]})')
+                                                except Exception:
+                                                    pass
                                     except Exception as e2:
-                                        _aw(f'    drawingViews iterate ERR: {e2}')
-                                        api_summary = f'drawingViews ERR:{e2}'
+                                        _aw(f'    {attr} iterate ERR: {e2}')
+                                        api_summary = f'{attr} ERR:{e2}'
                             except AttributeError:
                                 _aw(f'    {attr}: no attr')
                             except Exception as e:
                                 _aw(f'    {attr}: ERR {e}')
                     except Exception as e:
                         _aw(f'  activeSheet ERR: {e}')
+
+                # ── Oct 2026 dimension placement API ──
+                _aw('--- adsk.drawing dimension API (Oct 2026) ---')
+                for cls_name in ('LinearDimension', 'RadialDimension',
+                                 'AngularDimension', 'DiameterDimension',
+                                 'LinearDimensionDefinition', 'RadialDimensionDefinition',
+                                 'DrawingDimension', 'DrawingDimensions',
+                                 'View', 'Views', 'Sheet', 'Sheets',
+                                 'BaseViewInput', 'DrawingView', 'DrawingViews'):
+                    try:
+                        cls = getattr(adsk.drawing, cls_name)
+                        _aw(f'  {cls_name}: FOUND ({cls!r})')
+                    except AttributeError:
+                        _aw(f'  {cls_name}: not in adsk.drawing')
+                    except Exception as e:
+                        _aw(f'  {cls_name}: ERR {e}')
+
+                # ── ViewTypes enum integer values ──
+                _aw('--- ViewTypes enum values ---')
+                try:
+                    vt = adsk.drawing.ViewTypes
+                    for name in dir(vt):
+                        if name.startswith('_'):
+                            continue
+                        try:
+                            _aw(f'  ViewTypes.{name} = {getattr(vt, name)!r}')
+                        except Exception:
+                            pass
+                except Exception as e:
+                    _aw(f'  ViewTypes ERR: {e}')
+
+                # ── ViewOrientationTypes enum values ──
+                _aw('--- ViewOrientationTypes enum values ---')
+                try:
+                    vot = adsk.drawing.ViewOrientationTypes
+                    for name in dir(vot):
+                        if name.startswith('_'):
+                            continue
+                        try:
+                            _aw(f'  ViewOrientationTypes.{name} = {getattr(vot, name)!r}')
+                        except Exception:
+                            pass
+                except Exception as e:
+                    _aw(f'  ViewOrientationTypes ERR: {e}')
 
                 _aw('=== DONE ===')
         except Exception as e:
