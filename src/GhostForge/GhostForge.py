@@ -348,42 +348,91 @@ def _extreme_view_pts(view):
     return best
 
 
-def _place_linear_dim(sheet, role, view_info, model_value_mm=None, slot=0):
-    """Place a linear dimension using actual ViewCurve endpoints as anchors.
+def _guess_dim_orient(raw_type, dim_obj):
+    """Return 'H' or 'V' by inspecting sketch geometry. Defaults to 'H'."""
+    try:
+        if raw_type == 'SketchLinearDimension':
+            sp = dim_obj.startSketchPoint.geometry
+            ep = dim_obj.endSketchPoint.geometry
+            return 'H' if abs(ep.x - sp.x) >= abs(ep.y - sp.y) else 'V'
+        elif raw_type == 'SketchOffsetDimension':
+            ent = dim_obj.entityOne
+            sp  = ent.startSketchPoint.geometry
+            ep  = ent.endSketchPoint.geometry
+            dx  = abs(ep.x - sp.x)
+            dy  = abs(ep.y - sp.y)
+            # Offset is perpendicular to the entity: horizontal entity → vertical offset
+            return 'V' if dx >= dy else 'H'
+    except Exception:
+        pass
+    return 'H'
 
-    addLinearDimension requires startPoint/endPoint to be on view curves.
-    L → vertical (y-extremes, left side),  W → horizontal (x-extremes, top).
-    slot offsets each subsequent dim in the same view away from the previous one.
-    textOverride is always applied when model_value_mm is given so the annotation
-    shows the model parameter value rather than the view geometry extent.
+
+def _search_linear_pts(view, target_paper_mm, orient='H', tol=0.5):
+    """Search ViewCurve endpoint pairs for one separated by target_paper_mm.
+
+    orient 'H' → look for horizontal separation; 'V' → vertical.
+    Pass 1: strict — pair must be mostly aligned with orient (perp < 25% + 0.1 mm).
+    Pass 2: fallback — any pair whose direct distance matches the target.
+    Returns (DrawingPoint, DrawingPoint) or (None, None).
+    """
+    pts = []
+    for ci in range(view.viewCurves.count):
+        c = view.viewCurves.item(ci)
+        for pt in (c.startPoint, c.endPoint):
+            try:
+                co = pt.coordinate
+                pts.append((co.x, co.y, pt))
+            except Exception:
+                pass
+
+    for strict in (True, False):
+        for i in range(len(pts)):
+            xi, yi, pti = pts[i]
+            for j in range(i + 1, len(pts)):
+                xj, yj, ptj = pts[j]
+                dx, dy = abs(xj - xi), abs(yj - yi)
+                main = dx if orient == 'H' else dy
+                perp = dy if orient == 'H' else dx
+                if strict:
+                    if abs(main - target_paper_mm) <= tol and perp <= main * 0.25 + 0.1:
+                        return pti, ptj
+                else:
+                    if abs(math.hypot(dx, dy) - target_paper_mm) <= tol:
+                        return pti, ptj
+
+    return None, None
+
+
+def _place_linear_dim(sheet, view_info, model_value_mm, orient='H', slot=0):
+    """Search the view for geometry matching model_value_mm and place a linear dim.
+
+    orient 'H' → expects a horizontal pair, places text above the view bbox.
+    orient 'V' → expects a vertical pair, places text left of the view bbox.
+    slot staggers successive dims of the same orient in the same view.
+    Returns True if placed, False if no matching geometry found.
     """
     x0, y0, x1, y1 = view_info['bbox']
-    cx, cy  = view_info['cx'], view_info['cy']
-    scale   = view_info.get('scale', 1.0) or 1.0
-    dims    = sheet.drawingDimensions
-    pts     = _extreme_view_pts(view_info['view'])
-    placed  = None
+    scale  = view_info.get('scale', 1.0) or 1.0
+    dims   = sheet.drawingDimensions
+    target = model_value_mm * scale
 
-    if role == 'L':
-        dp1, dp2 = pts['min_y'], pts['max_y']
-        if dp1 is None or dp2 is None:
-            return
-        offset = x0 - DIM_GAP - slot * DIM_STEP
-        placed = dims.addLinearDimension(dp1, dp2, _dp(offset, cy))
-    elif role == 'W':
-        dp1, dp2 = pts['min_x'], pts['max_x']
-        if dp1 is None or dp2 is None:
-            return
-        offset = y1 + DIM_GAP + slot * DIM_STEP
-        placed = dims.addLinearDimension(dp1, dp2, _dp(cx, offset))
+    pt1, pt2 = _search_linear_pts(view_info['view'], target, orient)
+    if pt1 is None:
+        return False
+
+    co1 = pt1.coordinate
+    co2 = pt2.coordinate
+    mx  = (co1.x + co2.x) / 2
+    my  = (co1.y + co2.y) / 2
+
+    if orient == 'H':
+        place = _dp(mx, y1 + DIM_GAP + slot * DIM_STEP)
     else:
-        return
+        place = _dp(x0 - DIM_GAP - slot * DIM_STEP, my)
 
-    if placed is not None and model_value_mm is not None:
-        try:
-            placed.textOverride = f'{model_value_mm:.2f}'
-        except Exception:
-            pass
+    dims.addLinearDimension(pt1, pt2, place)
+    return True
 
 
 def _arc_scale(view_info):
@@ -468,10 +517,12 @@ def collect_dim_list(design):
                         entry_type  = 'linear'
                         entry_role  = 'W'
                         entry_str   = f'{val:.2f} mm'
+                    orient = _guess_dim_orient(raw, dim) if entry_type == 'linear' else None
                     result.append({
                         'id':         p.name,
                         'type':       entry_type,
                         'role':       entry_role,
+                        'orient':     orient,
                         'label':      f'{p.name}  [{sketch.name} · {dim_type}]',
                         'params_str': entry_str,
                         'value':      val,
@@ -496,6 +547,7 @@ def collect_dim_list(design):
                                         'id':         p.name,
                                         'type':       'linear',
                                         'role':       'L',
+                                        'orient':     'V',
                                         'label':      f'{p.name}  [Extrude · {ef.name}]',
                                         'params_str': f'{val:.2f} mm',
                                         'value':      val,
@@ -1128,14 +1180,62 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 table.addCommandInput(p,  row, 1)
                 table.addCommandInput(dd, row, 2)
 
+            h_pv = FCPreviewHandler()
             h_ex = FCExecuteHandler()
             h_ds = FCDestroyHandler()
+            cmd.executePreview.add(h_pv)
             cmd.execute.add(h_ex)
             cmd.destroy.add(h_ds)
-            handlers.extend([h_ex, h_ds])
+            handlers.extend([h_pv, h_ex, h_ds])
         except Exception as e:
             if ui:
                 ui.messageBox(f'Dim Checklist dialog error:\n{e}')
+
+
+class FCPreviewHandler(adsk.core.CommandEventHandler):
+    """Fires on every input change; places dims live. Fusion auto-rolls back or we
+    manage cleanup ourselves via _clear_dims at the start of each notify call."""
+    def notify(self, args):
+        try:
+            dims_list   = _pending['fc'].get('dims_list', [])
+            views       = _pending['fc'].get('views', [])
+            inputs      = args.command.commandInputs
+            drawing_doc = find_open_drawing()
+            if not drawing_doc:
+                return
+
+            _clear_dims(drawing_doc)
+            sheet = drawing_doc.drawing.activeSheet
+            slots = {}
+
+            for i, dim in enumerate(dims_list):
+                dd = inputs.itemById(f'fc_view_{i}')
+                if not dd or not dd.selectedItem:
+                    continue
+                sel = dd.selectedItem.index
+                if sel == 0:
+                    continue  # (skip)
+                view_idx = sel - 1
+                if view_idx >= len(views):
+                    continue
+                vi = views[view_idx]
+                try:
+                    if dim['type'] == 'linear':
+                        orient = dim.get('orient') or 'H'
+                        key    = (view_idx, orient)
+                        slot   = slots.get(key, 0)
+                        slots[key] = slot + 1
+                        _place_linear_dim(sheet, vi, dim['value'], orient=orient, slot=slot)
+                    elif dim['type'] == 'radial':
+                        _place_radial_dim(sheet, vi, dim['value'])
+                    elif dim['type'] == 'diameter':
+                        _place_diameter_dim(sheet, vi, dim['value'])
+                except Exception:
+                    pass
+
+            args.isValidResult = False  # always run execute fresh on OK
+        except Exception:
+            pass
 
 
 class FCExecuteHandler(adsk.core.CommandEventHandler):
@@ -1157,6 +1257,13 @@ class FCExecuteHandler(adsk.core.CommandEventHandler):
 class FCDestroyHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
         if not _pending['fc'].pop('ok', False):
+            # Preview may have placed dims — remove them on cancel
+            try:
+                drawing_doc = find_open_drawing()
+                if drawing_doc:
+                    _clear_dims(drawing_doc)
+            except Exception:
+                pass
             _pending['fc'].clear()
             return
         assignments = _pending['fc'].pop('assignments', [])
@@ -1182,11 +1289,14 @@ class FCDestroyHandler(adsk.core.CommandEventHandler):
             vi = views[view_idx]
             try:
                 if dim['type'] == 'linear':
-                    key  = (view_idx, dim['role'])
-                    slot = slots.get(key, 0)
+                    orient = dim.get('orient') or 'H'
+                    key    = (view_idx, orient)
+                    slot   = slots.get(key, 0)
                     slots[key] = slot + 1
-                    _place_linear_dim(sheet, dim['role'], vi, dim['value'], slot=slot)
-                    placed.append(f"{dim['label']}: {dim['params_str']} → {vi['label']}")
+                    if _place_linear_dim(sheet, vi, dim['value'], orient=orient, slot=slot):
+                        placed.append(f"{dim['label']}: {dim['params_str']} → {vi['label']}")
+                    else:
+                        errors.append(f"{dim['id']} {dim['value']:.2f}mm: no matching geometry in {vi['label']}")
                 elif dim['type'] == 'radial':
                     if _place_radial_dim(sheet, vi, dim['value']):
                         placed.append(f"{dim['label']}: {dim['params_str']} → {vi['label']}")
