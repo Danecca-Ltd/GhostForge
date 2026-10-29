@@ -6,7 +6,7 @@ Single panel in the Drawing workspace (FusionDocTab) containing:
   • Dim Checklist    — feature-by-feature checklist for selective annotation
   • DWG Probe        — diagnostic entity dump + command trials (dev tool)
 """
-import adsk.core, adsk.fusion, adsk.drawing, os, math, json
+import adsk.core, adsk.fusion, adsk.drawing, os, math, json, re
 
 # ─── Globals ─────────────────────────────────────────────────────────────────
 app      = None
@@ -34,7 +34,15 @@ INTERNAL_TO_MM = 10.0
 TEMP_DIR   = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'Temp')
 DESKTOP    = os.path.join(os.path.expanduser('~'), 'Desktop')
 _RESOURCES  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
-_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc_state.json')
+_STATE_DIR  = os.path.dirname(os.path.abspath(__file__))
+
+
+def _state_file(drawing_doc=None):
+    """Return the per-drawing state file path, or a generic fallback."""
+    if drawing_doc:
+        safe = re.sub(r'[^\w\-]', '_', drawing_doc.name)[:60]
+        return os.path.join(_STATE_DIR, f'fc_state_{safe}.json')
+    return os.path.join(_STATE_DIR, 'fc_state.json')
 
 
 def _tmp(name):
@@ -290,8 +298,7 @@ def _enumerate_views(drawing_doc):
     result = []
     for i in range(sheet.views.count):
         v  = sheet.views.item(i)
-        if v.type in (2, 3):  # skip Section, Detail
-            continue
+        pass  # all view types included (Section=2, Detail=3 both have usable geometry)
         bb = _view_bbox(v)
         if bb is None:
             continue
@@ -303,13 +310,21 @@ def _enumerate_views(drawing_doc):
         except Exception:
             pass
         try:
-            scale = float(v.scaleValue) if v.scaleValue else 1.0
+            scale = float(v.scale)
         except Exception:
-            pass
+            try:
+                scale = float(v.scaleValue)
+            except Exception:
+                pass
+        scale_str = f'{scale:.4g}' if scale != 1.0 else '1:1'
         if v.type == 0 and ori is not None and ori in _ORI_NAMES:
             label = f'{_ORI_NAMES[ori]} (Base)'
         elif v.type == 0:
             label = f'Base {i}'
+        elif v.type == 2:
+            label = f'Section {i} ({scale_str})'
+        elif v.type == 3:
+            label = f'Detail {i} ({scale_str})'
         else:
             label = f'View {i} ({x1-x0:.0f}×{y1-y0:.0f}mm)'
         result.append({
@@ -369,13 +384,13 @@ def _guess_dim_orient(raw_type, dim_obj):
     return 'H'
 
 
-def _search_linear_pts(view, target_paper_mm, orient='H', tol=0.5):
-    """Search ViewCurve endpoint pairs for one separated by target_paper_mm.
-
-    orient 'H' → look for horizontal separation; 'V' → vertical.
-    Pass 1: strict — pair must be mostly aligned with orient (perp < 25% + 0.1 mm).
-    Pass 2: fallback — any pair whose direct distance matches the target.
-    Returns (DrawingPoint, DrawingPoint) or (None, None).
+def _search_linear_pts(view, target_paper_mm, orient='H', tol=0.005):
+    """Return the ViewCurve endpoint pair whose orient-axis separation best matches
+    target_paper_mm (minimum error), subject to:
+      - error < tol (paper-space tolerance, default 0.005 mm)
+      - perpendicular separation < 2.0 mm (endpoints must be nearly aligned)
+    Arc/circle CENTER POINTS are included so dims to hole centers can be found.
+    Returns (None, None) if no qualifying pair is found.
     """
     pts = []
     for ci in range(view.viewCurves.count):
@@ -386,23 +401,59 @@ def _search_linear_pts(view, target_paper_mm, orient='H', tol=0.5):
                 pts.append((co.x, co.y, pt))
             except Exception:
                 pass
+        # Include center of arcs/circles — enables dims-to-hole-center
+        try:
+            cp = c.centerPoint
+            co = cp.coordinate
+            pts.append((co.x, co.y, cp))
+        except Exception:
+            pass
 
-    for strict in (True, False):
-        for i in range(len(pts)):
-            xi, yi, pti = pts[i]
-            for j in range(i + 1, len(pts)):
-                xj, yj, ptj = pts[j]
-                dx, dy = abs(xj - xi), abs(yj - yi)
-                main = dx if orient == 'H' else dy
-                perp = dy if orient == 'H' else dx
-                if strict:
-                    if abs(main - target_paper_mm) <= tol and perp <= main * 0.25 + 0.1:
-                        return pti, ptj
-                else:
-                    if abs(math.hypot(dx, dy) - target_paper_mm) <= tol:
-                        return pti, ptj
+    best_pti, best_ptj = None, None
+    best_err = tol  # only accept pairs within tol of target
 
-    return None, None
+    for i in range(len(pts)):
+        xi, yi, pti = pts[i]
+        for j in range(i + 1, len(pts)):
+            xj, yj, ptj = pts[j]
+            dx, dy = abs(xj - xi), abs(yj - yi)
+            main = dx if orient == 'H' else dy
+            perp = dy if orient == 'H' else dx
+            err  = abs(main - target_paper_mm)
+            if err < best_err and perp <= 2.0:
+                best_err  = err
+                best_pti  = pti
+                best_ptj  = ptj
+
+    return best_pti, best_ptj
+
+
+def _verify_placed_dim(placed, expected_mm, tol=0.5):
+    """Check the placed dim's displayed text against the expected model value.
+
+    Fusion shows the TRUE 3D distance, which can differ from the paper-space
+    distance we searched for when the endpoints have depth differences.  If the
+    text can be parsed and its value is farther than tol from expected_mm, the
+    dim is deleted and None is returned.  If the text is absent or unparseable
+    the dim is kept (benefit of the doubt).
+    """
+    try:
+        t = placed.text
+        if t:
+            m = re.search(r'(\d+(?:[.,]\d+)?)', t)
+            if m:
+                val = float(m.group(1).replace(',', '.'))
+                # Text is in document units (usually mm).
+                # Accept if within tol; also try cm (val × 10) as fallback.
+                if abs(val - expected_mm) <= tol:
+                    return placed
+                if abs(val * 10.0 - expected_mm) <= tol:
+                    return placed
+                placed.deleteMe()
+                return None
+    except Exception:
+        pass
+    return placed  # can't verify — keep
 
 
 def _place_linear_dim(sheet, view_info, model_value_mm, orient='H', slot=0):
@@ -411,7 +462,7 @@ def _place_linear_dim(sheet, view_info, model_value_mm, orient='H', slot=0):
     orient 'H' → expects a horizontal pair, places text above the view bbox.
     orient 'V' → expects a vertical pair, places text left of the view bbox.
     slot staggers successive dims of the same orient in the same view.
-    Returns True if placed, False if no matching geometry found.
+    Returns the placed DrawingDimension object, or None on failure.
     """
     x0, y0, x1, y1 = view_info['bbox']
     scale  = view_info.get('scale', 1.0) or 1.0
@@ -420,7 +471,7 @@ def _place_linear_dim(sheet, view_info, model_value_mm, orient='H', slot=0):
 
     pt1, pt2 = _search_linear_pts(view_info['view'], target, orient)
     if pt1 is None:
-        return False
+        return None
 
     co1 = pt1.coordinate
     co2 = pt2.coordinate
@@ -434,72 +485,133 @@ def _place_linear_dim(sheet, view_info, model_value_mm, orient='H', slot=0):
 
     before = dims.count
     dims.addLinearDimension(pt1, pt2, place)
-    if dims.count <= before:
-        return False
-
-    # Verify the placed dim actually shows the expected model value.
-    # addLinearDimension measures the true 3D model-space distance, which can
-    # differ from the paper-space distance / scale when endpoints are at different
-    # depths. If it's wrong, delete the dim and report failure.
-    try:
-        placed = dims.item(dims.count - 1)
-        placed_mm = placed.parameter.value * INTERNAL_TO_MM
-        if abs(placed_mm - model_value_mm) > 0.1:
-            placed.deleteMe()
-            return False
-    except Exception:
-        pass  # can't verify — keep the dim
-
-    return True
+    if dims.count > before:
+        return _verify_placed_dim(dims.item(dims.count - 1), model_value_mm)
+    return None
 
 
 def _arc_scale(view_info):
     return view_info.get('scale', 1.0) or 1.0
 
 
+def _arc_info(c):
+    """Return (cx, cy, r) all in paper-space mm for a ViewCurve arc/circle, or None.
+
+    Approach 1: centerPoint + startPoint — startPoint is always a point ON the arc,
+                so distance(center, start) = radius. midPoint is NOT used because it
+                does not exist on DrawingViewCurve in all Fusion builds.
+    Approach 2: centerPoint + endPoint  — same idea, alternate endpoint.
+    Approach 3: circumscribed circle of startPoint / endPoint and their midpoint
+                computed from both (only for open arcs where centerPoint is absent).
+    Note: c.geometry returns model-space cm, not paper-space mm — never used here.
+    """
+    # Approach 1: center + start (most reliable; works whenever centerPoint exists)
+    try:
+        cp = c.centerPoint.coordinate
+        sp = c.startPoint.coordinate
+        r  = math.hypot(sp.x - cp.x, sp.y - cp.y)
+        if r > 0.01:
+            return cp.x, cp.y, r
+    except Exception:
+        pass
+
+    # Approach 2: center + end (same idea, different endpoint)
+    try:
+        cp = c.centerPoint.coordinate
+        ep = c.endPoint.coordinate
+        r  = math.hypot(ep.x - cp.x, ep.y - cp.y)
+        if r > 0.01:
+            return cp.x, cp.y, r
+    except Exception:
+        pass
+
+    # Approach 3: circumscribed circle of start / chord-midpoint / end
+    # (for curves that have startPoint/endPoint but no accessible centerPoint)
+    try:
+        ax, ay = c.startPoint.coordinate.x, c.startPoint.coordinate.y
+        ex, ey = c.endPoint.coordinate.x,   c.endPoint.coordinate.y
+        # Use the geometric midpoint of the chord as a third point approximation.
+        # This is only exact for semicircles; for shallow arcs a small error is
+        # introduced but the 0.1 mm best-match tolerance absorbs it.
+        bx, by = (ax + ex) / 2, (ay + ey) / 2
+        # Perpendicular bisector intersection gives circle center
+        # (degenerate when ax≈ex and ay≈ey, i.e. nearly closed arc — skip then)
+        d = 2 * (ax*(by-ey) + bx*(ey-ay) + ex*(ay-by))
+        if abs(d) > 1e-9:
+            ux = ((ax*ax+ay*ay)*(by-ey) + (bx*bx+by*by)*(ey-ay) + (ex*ex+ey*ey)*(ay-by)) / d
+            uy = ((ax*ax+ay*ay)*(ex-bx) + (bx*bx+by*by)*(ax-ex) + (ex*ex+ey*ey)*(bx-ax)) / d
+            r  = math.hypot(ax-ux, ay-uy)
+            if r > 0.01:
+                return ux, uy, r
+    except Exception:
+        pass
+
+    return None
+
+
 def _place_radial_dim(sheet, view_info, target_r_mm):
-    """Find arc/circle in view and place a radial dim. Returns True on success."""
+    """Find arc/circle in view closest to target_r_mm and place a radial dim.
+    Uses best-match search (0.1 mm tolerance on radius).
+    Returns the placed DrawingDimension object, or None on failure.
+    """
     v     = view_info['view']
     dims  = sheet.drawingDimensions
     scale = _arc_scale(view_info)
+    best_err, best_c, best_cx, best_cy, best_r = 0.1, None, None, None, None
     for ci in range(v.viewCurves.count):
-        c = v.viewCurves.item(ci)
-        if c.type not in (1, 2):  # Arc=1, Circle=2
+        c   = v.viewCurves.item(ci)
+        inf = _arc_info(c)
+        if inf is None:
             continue
-        try:
-            cp = c.centerPoint.coordinate
-            mp = c.midPoint.coordinate
-            r  = math.hypot(mp.x - cp.x, mp.y - cp.y)
-            if abs(r - target_r_mm * scale) > 0.5:
-                continue
-            dims.addRadialDimension(c, _dp(cp.x + r + DIM_GAP, cp.y))
-            return True
-        except Exception:
-            pass
-    return False
+        cx, cy, r = inf
+        err = abs(r - target_r_mm * scale)
+        if err < best_err:
+            best_err, best_c, best_cx, best_cy, best_r = err, c, cx, cy, r
+    if best_c is None:
+        return None
+    before = dims.count
+    dims.addRadialDimension(best_c, _dp(best_cx + best_r + DIM_GAP, best_cy))
+    if dims.count > before:
+        return _verify_placed_dim(dims.item(dims.count - 1), target_r_mm)
+    return None
 
 
 def _place_diameter_dim(sheet, view_info, target_d_mm):
-    """Find arc/circle matching diameter target_d_mm and place Ø dim. Returns True."""
-    v     = view_info['view']
-    dims  = sheet.drawingDimensions
-    scale = _arc_scale(view_info)
+    """Find arc/circle matching diameter target_d_mm and place Ø dim.
+
+    Best-match arc search (0.1 mm radius tolerance).  If no arc is found,
+    falls back to a linear search — the diameter can appear as two parallel
+    lines when the cylinder is viewed from the side.  In that case the text
+    is overridden to include the Ø prefix.
+    Returns the placed DrawingDimension object, or None on failure.
+    """
+    v           = view_info['view']
+    dims        = sheet.drawingDimensions
+    scale       = _arc_scale(view_info)
     target_r_mm = target_d_mm / 2.0
+    best_err, best_c, best_cx, best_cy, best_r = 0.1, None, None, None, None
     for ci in range(v.viewCurves.count):
-        c = v.viewCurves.item(ci)
-        if c.type not in (1, 2):  # Arc=1, Circle=2
+        c   = v.viewCurves.item(ci)
+        inf = _arc_info(c)
+        if inf is None:
             continue
+        cx, cy, r = inf
+        err = abs(r - target_r_mm * scale)
+        if err < best_err:
+            best_err, best_c, best_cx, best_cy, best_r = err, c, cx, cy, r
+    if best_c is not None:
+        before = dims.count
+        dims.addDiameterDimension(best_c, _dp(best_cx + best_r + DIM_GAP, best_cy))
+        if dims.count > before:
+            return _verify_placed_dim(dims.item(dims.count - 1), target_d_mm)
+    # Fallback: diameter appears as two parallel lines (cylinder side view)
+    placed = _place_linear_dim(sheet, view_info, target_d_mm, orient='H')
+    if placed is not None:
         try:
-            cp = c.centerPoint.coordinate
-            mp = c.midPoint.coordinate
-            r  = math.hypot(mp.x - cp.x, mp.y - cp.y)
-            if abs(r - target_r_mm * scale) > 0.5:
-                continue
-            dims.addDiameterDimension(c, _dp(cp.x + r + DIM_GAP, cp.y))
-            return True
+            placed.text = f'Ø{target_d_mm:.2f}'  # add Ø prefix
         except Exception:
             pass
-    return False
+    return placed
 
 
 def collect_dim_list(design):
@@ -515,9 +627,12 @@ def collect_dim_list(design):
                     if p is None or p.name in seen:
                         continue
                     unit = (p.unit or '').strip()
-                    if unit in ('', 'ul', 'deg'):
+                    if unit in ('', 'ul'):
                         continue
-                    val = p.value * INTERNAL_TO_MM
+                    if unit == 'deg':
+                        val = math.degrees(p.value)
+                    else:
+                        val = p.value * INTERNAL_TO_MM
                     if val <= 0:
                         continue
                     seen.add(p.name)
@@ -531,6 +646,10 @@ def collect_dim_list(design):
                         entry_type  = 'diameter'
                         entry_role  = 'D'
                         entry_str   = f'Ø{val:.2f} mm'   # Ø prefix
+                    elif unit == 'deg':
+                        entry_type  = 'angular'
+                        entry_role  = 'A'
+                        entry_str   = f'{val:.2f}°'
                     else:
                         entry_type  = 'linear'
                         entry_role  = 'W'
@@ -602,6 +721,33 @@ def collect_dim_list(design):
                     'value':      r,
                     'edge_count': edge_count,
                 })
+        except Exception:
+            pass
+
+    # Revolve features — collect rotation angle
+    for comp in design.allComponents:
+        try:
+            for i in range(comp.features.revolveFeatures.count):
+                try:
+                    rf  = comp.features.revolveFeatures.item(i)
+                    ext = adsk.fusion.AngleExtentDefinition.cast(rf.extentOne)
+                    if ext:
+                        p = ext.angle
+                        if p and p.name not in seen:
+                            val = math.degrees(p.value)
+                            if val > 0:
+                                seen.add(p.name)
+                                result.append({
+                                    'id':         p.name,
+                                    'type':       'angular',
+                                    'role':       'A',
+                                    'orient':     None,
+                                    'label':      f'{p.name}  [Revolve · {rf.name}]',
+                                    'params_str': f'{val:.2f}°',
+                                    'value':      val,
+                                })
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1139,17 +1285,18 @@ class DADestroyHandler(adsk.core.CommandEventHandler):
 
 # ─── Dim Checklist ───────────────────────────────────────────────────────────
 
-def _load_fc_state():
-    """Return {dim_id: view_label_or_None} from the persistent JSON state file."""
+def _load_fc_state(drawing_doc=None):
+    """Return (placements, statuses) dicts from the per-drawing JSON state file."""
     try:
-        with open(_STATE_FILE, 'r') as f:
-            return json.load(f).get('placements', {})
+        with open(_state_file(drawing_doc), 'r') as f:
+            data = json.load(f)
+            return data.get('placements', {}), data.get('statuses', {})
     except Exception:
-        return {}
+        return {}, {}
 
 
-def _save_fc_state(dims_list, placements_by_idx, views):
-    """Persist {dim_id: view_label_or_None} keyed by view label for cross-session stability."""
+def _save_fc_state(dims_list, placements_by_idx, views, statuses, drawing_doc=None):
+    """Persist placements and statuses keyed by view label for cross-session stability."""
     by_label = {}
     for dim in dims_list:
         v_idx = placements_by_idx.get(dim['id'])
@@ -1158,8 +1305,8 @@ def _save_fc_state(dims_list, placements_by_idx, views):
         else:
             by_label[dim['id']] = None
     try:
-        with open(_STATE_FILE, 'w') as f:
-            json.dump({'placements': by_label}, f, indent=2)
+        with open(_state_file(drawing_doc), 'w') as f:
+            json.dump({'placements': by_label, 'statuses': statuses}, f, indent=2)
     except Exception:
         pass
 
@@ -1198,6 +1345,10 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
         try:
             cmd    = args.command
             inputs = cmd.commandInputs
+            try:
+                cmd.isAutoTerminate = False
+            except Exception:
+                pass
 
             design      = find_open_design()
             drawing_doc = find_open_drawing()
@@ -1210,25 +1361,19 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
 
             dims_list  = collect_dim_list(design)
             views      = _enumerate_views(drawing_doc) if drawing_doc else []
-            saved      = _load_fc_state()  # {dim_id: view_label}
+            saved_placements, saved_statuses = _load_fc_state(drawing_doc)
 
             # Resolve saved view labels → current view indices
             label_to_idx = {v['label']: j for j, v in enumerate(views)}
             placements = {}  # {dim_id: view_idx or None}
             for dim in dims_list:
-                lbl = saved.get(dim['id'])
+                lbl = saved_placements.get(dim['id'])
                 placements[dim['id']] = label_to_idx.get(lbl)  # None if label gone
 
             _pending['fc']['dims_list']  = dims_list
             _pending['fc']['views']      = views
             _pending['fc']['placements'] = placements
-
-            # A hidden SelectionCommandInput with limits(0,0) satisfies Fusion's
-            # Drawing-workspace "select context" requirement so the dialog opens
-            # directly without a pre-select prompt.
-            sel_input = inputs.addSelectionInput('fc_ctx', '', '')
-            sel_input.setSelectionLimits(0, 0)
-            sel_input.isVisible = False
+            _pending['fc']['statuses']   = dict(saved_statuses)
 
             no_drawing = '' if drawing_doc else '<br><i>No drawing open — Place buttons will be inactive.</i>'
             inputs.addTextBoxCommandInput(
@@ -1278,10 +1423,7 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 # isCheckBox=False sticks at True and won't re-fire inputChanged.
                 btn = inputs.addBoolValueInput(f'fc_place_{i}', 'Place', True, '', False)
 
-                if saved_idx is not None and saved_idx < len(views):
-                    status_text = f'✓ {views[saved_idx]["label"]}'
-                else:
-                    status_text = '—'
+                status_text = saved_statuses.get(dim['id'], '—')
                 st = inputs.addTextBoxCommandInput(f'fc_status_{i}', '', status_text, 1, True)
 
                 table.addCommandInput(n,   row, 0)
@@ -1303,59 +1445,96 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
 
 
 class FCInputChangedHandler(adsk.core.InputChangedEventHandler):
-    """Handles Place button clicks: places/moves the individual dim on the drawing."""
+    """Handles Place button clicks: places/replaces only the one clicked dim.
+
+    Each dim's DrawingDimension object is stored in _pending['fc']['placed_objs']
+    so that clicking Place again moves the dim without touching any other dim.
+    """
     def notify(self, args):
         try:
             inp = args.input
-            # Only act on Place checkboxes becoming True (user clicked them)
             if not inp.id.startswith('fc_place_'):
                 return
             if not inp.value:
-                return  # ignore the reset-to-False firing
+                return  # ignore reset-to-False firing
 
             i = int(inp.id.split('_')[-1])
-
-            dims_list  = _pending['fc'].get('dims_list', [])
-            views      = _pending['fc'].get('views', [])
-            placements = _pending['fc'].get('placements', {})
-            inputs     = args.inputs
+            dims_list   = _pending['fc'].get('dims_list', [])
+            views       = _pending['fc'].get('views', [])
+            placements  = _pending['fc'].get('placements', {})
+            statuses    = _pending['fc'].setdefault('statuses', {})
+            placed_objs = _pending['fc'].setdefault('placed_objs', {})
+            inputs      = args.inputs
 
             if i >= len(dims_list):
                 inp.value = False
                 return
 
-            # Sync ALL dropdowns → placements so that (skip) selections are respected
-            # even for rows where Place hasn't been explicitly clicked yet.
-            for j, d in enumerate(dims_list):
-                dd_j = inputs.itemById(f'fc_view_{j}')
-                if dd_j and dd_j.selectedItem:
-                    sel_j = dd_j.selectedItem.index
-                    placements[d['id']] = sel_j - 1 if sel_j > 0 else None
+            dim    = dims_list[i]
+            dim_id = dim['id']
 
-            results = {}
-            drawing_doc = find_open_drawing()
-            if drawing_doc:
-                _clear_dims(drawing_doc)
-                results = _place_dims_from_placements(
-                    drawing_doc.drawing.activeSheet, dims_list, placements, views)
+            # Read only this dim's dropdown
+            dd    = inputs.itemById(f'fc_view_{i}')
+            v_idx = None
+            if dd and dd.selectedItem:
+                sel   = dd.selectedItem.index
+                v_idx = sel - 1 if sel > 0 else None
+            placements[dim_id] = v_idx
 
-            # Update status cells for all rows so ✗ feedback is visible everywhere
-            for j, d in enumerate(dims_list):
-                st = inputs.itemById(f'fc_status_{j}')
-                if not st:
-                    continue
-                v_idx = placements.get(d['id'])
-                if v_idx is None or v_idx >= len(views):
-                    st.text = '—'
-                elif results.get(d['id'], False):
-                    st.text = f'✓ {views[v_idx]["label"]}'
+            # Delete the previous DrawingDimension for this dim (if any)
+            old = placed_objs.get(dim_id)
+            if old is not None:
+                try:
+                    old.deleteMe()
+                except Exception:
+                    pass
+                placed_objs[dim_id] = None
+
+            # Place in the selected view
+            new_obj = None
+            if v_idx is not None and v_idx < len(views):
+                drawing_doc = find_open_drawing()
+                if drawing_doc:
+                    sheet  = drawing_doc.drawing.activeSheet
+                    vi     = views[v_idx]
+                    orient = dim.get('orient') or 'H'
+                    # Slot = how many other dims are already placed in same view+orient
+                    slot = sum(
+                        1 for d in dims_list
+                        if d['id'] != dim_id
+                        and placed_objs.get(d['id']) is not None
+                        and placements.get(d['id']) == v_idx
+                        and (d.get('orient') or 'H') == orient
+                    )
+                    try:
+                        if dim['type'] == 'linear':
+                            new_obj = _place_linear_dim(sheet, vi, dim['value'],
+                                                        orient=orient, slot=slot)
+                        elif dim['type'] == 'radial':
+                            new_obj = _place_radial_dim(sheet, vi, dim['value'])
+                        elif dim['type'] == 'diameter':
+                            new_obj = _place_diameter_dim(sheet, vi, dim['value'])
+                        # angular: no auto-placement; handled as "manual" below
+                    except Exception:
+                        new_obj = None
+                    placed_objs[dim_id] = new_obj
+
+            # Update only this dim's status cell and persist it
+            st = inputs.itemById(f'fc_status_{i}')
+            if st:
+                if dim.get('type') == 'angular':
+                    status_str = '∠ manual'
+                elif v_idx is None or v_idx >= len(views):
+                    status_str = '—'
+                elif new_obj is not None:
+                    status_str = f'✓ {views[v_idx]["label"]}'
                 else:
-                    st.text = f'✗ not found in {views[v_idx]["label"]}'
+                    status_str = f'✗ not found in {views[v_idx]["label"]}'
+                st.text = status_str
+                statuses[dim_id] = status_str
 
-            _save_fc_state(dims_list, placements, views)
-
-            # Reset checkbox so it can be clicked again
-            inp.value = False
+            _save_fc_state(dims_list, placements, views, statuses, find_open_drawing())
+            inp.value = False  # reset for next click
         except Exception:
             pass
 
