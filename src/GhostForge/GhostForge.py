@@ -1148,8 +1148,10 @@ def _save_fc_state(dims_list, placements_by_idx, views):
 
 
 def _place_dims_from_placements(sheet, dims_list, placements, views):
-    """Clear all dims and re-place every assigned dim. placements: {dim_id: view_idx}."""
-    slots = {}
+    """Clear all dims and re-place every assigned dim.
+    Returns {dim_id: True/False} for each dim that had a view assigned."""
+    results = {}
+    slots   = {}
     for dim in dims_list:
         v_idx = placements.get(dim['id'])
         if v_idx is None or v_idx >= len(views):
@@ -1161,13 +1163,17 @@ def _place_dims_from_placements(sheet, dims_list, placements, views):
                 key    = (v_idx, orient)
                 slot   = slots.get(key, 0)
                 slots[key] = slot + 1
-                _place_linear_dim(sheet, vi, dim['value'], orient=orient, slot=slot)
+                ok = _place_linear_dim(sheet, vi, dim['value'], orient=orient, slot=slot)
             elif dim['type'] == 'radial':
-                _place_radial_dim(sheet, vi, dim['value'])
+                ok = bool(_place_radial_dim(sheet, vi, dim['value']))
             elif dim['type'] == 'diameter':
-                _place_diameter_dim(sheet, vi, dim['value'])
+                ok = bool(_place_diameter_dim(sheet, vi, dim['value']))
+            else:
+                ok = False
+            results[dim['id']] = ok
         except Exception:
-            pass
+            results[dim['id']] = False
+    return results
 
 
 class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
@@ -1244,12 +1250,14 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
                         sel = (j == 0)
                     dd.listItems.add(lbl, bool(sel))
 
-                btn = inputs.addBoolValueInput(f'fc_place_{i}', 'Place', False, '', False)
+                # isCheckBox=True so the value resets False→True→False each click;
+                # isCheckBox=False sticks at True and won't re-fire inputChanged.
+                btn = inputs.addBoolValueInput(f'fc_place_{i}', 'Place', True, '', False)
 
                 if saved_idx is not None and saved_idx < len(views):
-                    status_text = f'&#x2713; {views[saved_idx]["label"]}'
+                    status_text = f'✓ {views[saved_idx]["label"]}'
                 else:
-                    status_text = '&#x2014;'
+                    status_text = '—'
                 st = inputs.addTextBoxCommandInput(f'fc_status_{i}', '', status_text, 1, True)
 
                 table.addCommandInput(n,   row, 0)
@@ -1275,8 +1283,12 @@ class FCInputChangedHandler(adsk.core.InputChangedEventHandler):
     def notify(self, args):
         try:
             inp = args.input
+            # Only act on Place checkboxes becoming True (user clicked them)
             if not inp.id.startswith('fc_place_'):
                 return
+            if not inp.value:
+                return  # ignore the reset-to-False firing
+
             i = int(inp.id.split('_')[-1])
 
             dims_list  = _pending['fc'].get('dims_list', [])
@@ -1285,10 +1297,12 @@ class FCInputChangedHandler(adsk.core.InputChangedEventHandler):
             inputs     = args.inputs
 
             if i >= len(dims_list):
+                inp.value = False
                 return
 
             dd = inputs.itemById(f'fc_view_{i}')
             if not dd or not dd.selectedItem:
+                inp.value = False
                 return
             sel      = dd.selectedItem.index   # 0=(skip), 1+=view
             view_idx = sel - 1 if sel > 0 else None
@@ -1296,21 +1310,30 @@ class FCInputChangedHandler(adsk.core.InputChangedEventHandler):
             dim = dims_list[i]
             placements[dim['id']] = view_idx
 
+            results = {}
             drawing_doc = find_open_drawing()
             if drawing_doc:
                 _clear_dims(drawing_doc)
-                _place_dims_from_placements(
+                results = _place_dims_from_placements(
                     drawing_doc.drawing.activeSheet, dims_list, placements, views)
 
-            # Update status cell for this row
-            st = inputs.itemById(f'fc_status_{i}')
-            if st:
-                if view_idx is not None and view_idx < len(views):
-                    st.text = f'&#x2713; {views[view_idx]["label"]}'
+            # Update status cells for all rows so ✗ feedback is visible everywhere
+            for j, d in enumerate(dims_list):
+                st = inputs.itemById(f'fc_status_{j}')
+                if not st:
+                    continue
+                v_idx = placements.get(d['id'])
+                if v_idx is None or v_idx >= len(views):
+                    st.text = '—'
+                elif results.get(d['id'], False):
+                    st.text = f'✓ {views[v_idx]["label"]}'
                 else:
-                    st.text = '&#x2014;'
+                    st.text = f'✗ not found in {views[v_idx]["label"]}'
 
             _save_fc_state(dims_list, placements, views)
+
+            # Reset checkbox so it can be clicked again
+            inp.value = False
         except Exception:
             pass
 
