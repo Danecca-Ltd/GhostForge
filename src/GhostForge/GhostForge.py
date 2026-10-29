@@ -444,7 +444,7 @@ def _place_linear_dim(sheet, view_info, model_value_mm, orient='H', slot=0):
     try:
         placed = dims.item(dims.count - 1)
         placed_mm = placed.parameter.value * INTERNAL_TO_MM
-        if abs(placed_mm - model_value_mm) > 1.5:
+        if abs(placed_mm - model_value_mm) > 0.1:
             placed.deleteMe()
             return False
     except Exception:
