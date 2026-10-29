@@ -432,7 +432,24 @@ def _place_linear_dim(sheet, view_info, model_value_mm, orient='H', slot=0):
     else:
         place = _dp(x0 - DIM_GAP - slot * DIM_STEP, my)
 
+    before = dims.count
     dims.addLinearDimension(pt1, pt2, place)
+    if dims.count <= before:
+        return False
+
+    # Verify the placed dim actually shows the expected model value.
+    # addLinearDimension measures the true 3D model-space distance, which can
+    # differ from the paper-space distance / scale when endpoints are at different
+    # depths. If it's wrong, delete the dim and report failure.
+    try:
+        placed = dims.item(dims.count - 1)
+        placed_mm = placed.parameter.value * INTERNAL_TO_MM
+        if abs(placed_mm - model_value_mm) > 1.5:
+            placed.deleteMe()
+            return False
+    except Exception:
+        pass  # can't verify — keep the dim
+
     return True
 
 
@@ -1206,6 +1223,13 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
             _pending['fc']['views']      = views
             _pending['fc']['placements'] = placements
 
+            # A hidden SelectionCommandInput with limits(0,0) satisfies Fusion's
+            # Drawing-workspace "select context" requirement so the dialog opens
+            # directly without a pre-select prompt.
+            sel_input = inputs.addSelectionInput('fc_ctx', '', '')
+            sel_input.setSelectionLimits(0, 0)
+            sel_input.isVisible = False
+
             no_drawing = '' if drawing_doc else '<br><i>No drawing open — Place buttons will be inactive.</i>'
             inputs.addTextBoxCommandInput(
                 'fc_desc', '',
@@ -1300,15 +1324,13 @@ class FCInputChangedHandler(adsk.core.InputChangedEventHandler):
                 inp.value = False
                 return
 
-            dd = inputs.itemById(f'fc_view_{i}')
-            if not dd or not dd.selectedItem:
-                inp.value = False
-                return
-            sel      = dd.selectedItem.index   # 0=(skip), 1+=view
-            view_idx = sel - 1 if sel > 0 else None
-
-            dim = dims_list[i]
-            placements[dim['id']] = view_idx
+            # Sync ALL dropdowns → placements so that (skip) selections are respected
+            # even for rows where Place hasn't been explicitly clicked yet.
+            for j, d in enumerate(dims_list):
+                dd_j = inputs.itemById(f'fc_view_{j}')
+                if dd_j and dd_j.selectedItem:
+                    sel_j = dd_j.selectedItem.index
+                    placements[d['id']] = sel_j - 1 if sel_j > 0 else None
 
             results = {}
             drawing_doc = find_open_drawing()
