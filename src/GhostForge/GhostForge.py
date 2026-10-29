@@ -6,7 +6,7 @@ Single panel in the Drawing workspace (FusionDocTab) containing:
   • Dim Checklist    — feature-by-feature checklist for selective annotation
   • DWG Probe        — diagnostic entity dump + command trials (dev tool)
 """
-import adsk.core, adsk.fusion, adsk.drawing, os, math
+import adsk.core, adsk.fusion, adsk.drawing, os, math, json
 
 # ─── Globals ─────────────────────────────────────────────────────────────────
 app      = None
@@ -33,7 +33,8 @@ CMD_PROBE    = 'GhostForge_DwgProbe'
 INTERNAL_TO_MM = 10.0
 TEMP_DIR   = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'Temp')
 DESKTOP    = os.path.join(os.path.expanduser('~'), 'Desktop')
-_RESOURCES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
+_RESOURCES  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
+_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc_state.json')
 
 
 def _tmp(name):
@@ -1121,6 +1122,54 @@ class DADestroyHandler(adsk.core.CommandEventHandler):
 
 # ─── Dim Checklist ───────────────────────────────────────────────────────────
 
+def _load_fc_state():
+    """Return {dim_id: view_label_or_None} from the persistent JSON state file."""
+    try:
+        with open(_STATE_FILE, 'r') as f:
+            return json.load(f).get('placements', {})
+    except Exception:
+        return {}
+
+
+def _save_fc_state(dims_list, placements_by_idx, views):
+    """Persist {dim_id: view_label_or_None} keyed by view label for cross-session stability."""
+    by_label = {}
+    for dim in dims_list:
+        v_idx = placements_by_idx.get(dim['id'])
+        if v_idx is not None and v_idx < len(views):
+            by_label[dim['id']] = views[v_idx]['label']
+        else:
+            by_label[dim['id']] = None
+    try:
+        with open(_STATE_FILE, 'w') as f:
+            json.dump({'placements': by_label}, f, indent=2)
+    except Exception:
+        pass
+
+
+def _place_dims_from_placements(sheet, dims_list, placements, views):
+    """Clear all dims and re-place every assigned dim. placements: {dim_id: view_idx}."""
+    slots = {}
+    for dim in dims_list:
+        v_idx = placements.get(dim['id'])
+        if v_idx is None or v_idx >= len(views):
+            continue
+        vi = views[v_idx]
+        try:
+            if dim['type'] == 'linear':
+                orient = dim.get('orient') or 'H'
+                key    = (v_idx, orient)
+                slot   = slots.get(key, 0)
+                slots[key] = slot + 1
+                _place_linear_dim(sheet, vi, dim['value'], orient=orient, slot=slot)
+            elif dim['type'] == 'radial':
+                _place_radial_dim(sheet, vi, dim['value'])
+            elif dim['type'] == 'diameter':
+                _place_diameter_dim(sheet, vi, dim['value'])
+        except Exception:
+            pass
+
+
 class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
         try:
@@ -1136,22 +1185,32 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     2, True)
                 return
 
-            dims_list = collect_dim_list(design)
-            views     = _enumerate_views(drawing_doc) if drawing_doc else []
-            _pending['fc']['dims_list'] = dims_list
-            _pending['fc']['views']     = views
+            dims_list  = collect_dim_list(design)
+            views      = _enumerate_views(drawing_doc) if drawing_doc else []
+            saved      = _load_fc_state()  # {dim_id: view_label}
 
-            no_drawing = '' if drawing_doc else '<br><i>No drawing open — dims will be skipped.</i>'
+            # Resolve saved view labels → current view indices
+            label_to_idx = {v['label']: j for j, v in enumerate(views)}
+            placements = {}  # {dim_id: view_idx or None}
+            for dim in dims_list:
+                lbl = saved.get(dim['id'])
+                placements[dim['id']] = label_to_idx.get(lbl)  # None if label gone
+
+            _pending['fc']['dims_list']  = dims_list
+            _pending['fc']['views']      = views
+            _pending['fc']['placements'] = placements
+
+            no_drawing = '' if drawing_doc else '<br><i>No drawing open — Place buttons will be inactive.</i>'
             inputs.addTextBoxCommandInput(
                 'fc_desc', '',
                 '<b>Dim Checklist</b><br>'
-                'Select the view for each dimension, then click OK. '
-                'Existing dims on the sheet are cleared and replaced. '
-                'Linear dims show the view geometry extent (scale-corrected); '
-                'R/Ø dims match arcs in the view.' + no_drawing,
+                'Select a view for each dimension, then click <b>Place</b>. '
+                'Click <b>Place</b> again after changing the view to move the dim. '
+                'State is saved between sessions.' + no_drawing,
                 4, True)
 
-            table = inputs.addTableCommandInput('fc_table', 'Dimensions', 3, '4:2:4')
+            # 5 columns: name | value | view | place-btn | status
+            table = inputs.addTableCommandInput('fc_table', 'Dimensions', 5, '4:2:4:1:3')
             table.hasGrid = True
             table.maximumVisibleRows = 12
             table.minimumVisibleRows = min(max(len(dims_list) + 1, 2), 6)
@@ -1163,157 +1222,109 @@ class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
             _hdr(0, 'Dimension')
             _hdr(1, 'Value')
             _hdr(2, 'View')
+            _hdr(3, '')
+            _hdr(4, 'Status')
 
             view_labels = ['(skip)'] + [v['label'] for v in views]
 
             for i, dim in enumerate(dims_list):
                 row = i + 1
+
                 n  = inputs.addTextBoxCommandInput(f'fc_name_{i}', '', dim['label'],      1, True)
                 p  = inputs.addTextBoxCommandInput(f'fc_val_{i}',  '', dim['params_str'], 1, True)
                 dd = inputs.addDropDownCommandInput(
                     f'fc_view_{i}', '', adsk.core.DropDownStyles.TextListDropDownStyle)
-                for j, lbl in enumerate(view_labels):
-                    # First view when views exist, else skip — works for all dim types
-                    default_sel = (j == 1 and bool(views)) or (j == 0 and not views)
-                    dd.listItems.add(lbl, bool(default_sel))
-                table.addCommandInput(n,  row, 0)
-                table.addCommandInput(p,  row, 1)
-                table.addCommandInput(dd, row, 2)
 
-            h_pv = FCPreviewHandler()
+                saved_idx = placements.get(dim['id'])  # view index or None
+                for j, lbl in enumerate(view_labels):
+                    # j=0 is "(skip)", j=1+ maps to views[j-1]
+                    if saved_idx is not None:
+                        sel = (j == saved_idx + 1)
+                    else:
+                        sel = (j == 0)
+                    dd.listItems.add(lbl, bool(sel))
+
+                btn = inputs.addBoolValueInput(f'fc_place_{i}', 'Place', False, '', False)
+
+                if saved_idx is not None and saved_idx < len(views):
+                    status_text = f'&#x2713; {views[saved_idx]["label"]}'
+                else:
+                    status_text = '&#x2014;'
+                st = inputs.addTextBoxCommandInput(f'fc_status_{i}', '', status_text, 1, True)
+
+                table.addCommandInput(n,   row, 0)
+                table.addCommandInput(p,   row, 1)
+                table.addCommandInput(dd,  row, 2)
+                table.addCommandInput(btn, row, 3)
+                table.addCommandInput(st,  row, 4)
+
+            h_ic = FCInputChangedHandler()
             h_ex = FCExecuteHandler()
             h_ds = FCDestroyHandler()
-            cmd.executePreview.add(h_pv)
+            cmd.inputChanged.add(h_ic)
             cmd.execute.add(h_ex)
             cmd.destroy.add(h_ds)
-            handlers.extend([h_pv, h_ex, h_ds])
+            handlers.extend([h_ic, h_ex, h_ds])
         except Exception as e:
             if ui:
                 ui.messageBox(f'Dim Checklist dialog error:\n{e}')
 
 
-class FCPreviewHandler(adsk.core.CommandEventHandler):
-    """Fires on every input change; places dims live. Fusion auto-rolls back or we
-    manage cleanup ourselves via _clear_dims at the start of each notify call."""
+class FCInputChangedHandler(adsk.core.InputChangedEventHandler):
+    """Handles Place button clicks: places/moves the individual dim on the drawing."""
     def notify(self, args):
         try:
-            dims_list   = _pending['fc'].get('dims_list', [])
-            views       = _pending['fc'].get('views', [])
-            inputs      = args.command.commandInputs
-            drawing_doc = find_open_drawing()
-            if not drawing_doc:
+            inp = args.input
+            if not inp.id.startswith('fc_place_'):
+                return
+            i = int(inp.id.split('_')[-1])
+
+            dims_list  = _pending['fc'].get('dims_list', [])
+            views      = _pending['fc'].get('views', [])
+            placements = _pending['fc'].get('placements', {})
+            inputs     = args.inputs
+
+            if i >= len(dims_list):
                 return
 
-            _clear_dims(drawing_doc)
-            sheet = drawing_doc.drawing.activeSheet
-            slots = {}
+            dd = inputs.itemById(f'fc_view_{i}')
+            if not dd or not dd.selectedItem:
+                return
+            sel      = dd.selectedItem.index   # 0=(skip), 1+=view
+            view_idx = sel - 1 if sel > 0 else None
 
-            for i, dim in enumerate(dims_list):
-                dd = inputs.itemById(f'fc_view_{i}')
-                if not dd or not dd.selectedItem:
-                    continue
-                sel = dd.selectedItem.index
-                if sel == 0:
-                    continue  # (skip)
-                view_idx = sel - 1
-                if view_idx >= len(views):
-                    continue
-                vi = views[view_idx]
-                try:
-                    if dim['type'] == 'linear':
-                        orient = dim.get('orient') or 'H'
-                        key    = (view_idx, orient)
-                        slot   = slots.get(key, 0)
-                        slots[key] = slot + 1
-                        _place_linear_dim(sheet, vi, dim['value'], orient=orient, slot=slot)
-                    elif dim['type'] == 'radial':
-                        _place_radial_dim(sheet, vi, dim['value'])
-                    elif dim['type'] == 'diameter':
-                        _place_diameter_dim(sheet, vi, dim['value'])
-                except Exception:
-                    pass
+            dim = dims_list[i]
+            placements[dim['id']] = view_idx
 
-            args.isValidResult = False  # always run execute fresh on OK
+            drawing_doc = find_open_drawing()
+            if drawing_doc:
+                _clear_dims(drawing_doc)
+                _place_dims_from_placements(
+                    drawing_doc.drawing.activeSheet, dims_list, placements, views)
+
+            # Update status cell for this row
+            st = inputs.itemById(f'fc_status_{i}')
+            if st:
+                if view_idx is not None and view_idx < len(views):
+                    st.text = f'&#x2713; {views[view_idx]["label"]}'
+                else:
+                    st.text = '&#x2014;'
+
+            _save_fc_state(dims_list, placements, views)
         except Exception:
             pass
 
 
 class FCExecuteHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
-        dims_list = _pending['fc'].get('dims_list', [])
-        inputs    = args.command.commandInputs
-        assignments = []
-        for i in range(len(dims_list)):
-            dd = inputs.itemById(f'fc_view_{i}')
-            if dd and dd.selectedItem:
-                sel = dd.selectedItem.index  # 0=(skip), 1+=view index
-                assignments.append(sel - 1 if sel > 0 else None)
-            else:
-                assignments.append(None)
-        _pending['fc']['ok']          = True
-        _pending['fc']['assignments'] = assignments
+        # Dims are placed individually via Place buttons; OK just closes the dialog.
+        _pending['fc'].clear()
 
 
 class FCDestroyHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
-        if not _pending['fc'].pop('ok', False):
-            # Preview may have placed dims — remove them on cancel
-            try:
-                drawing_doc = find_open_drawing()
-                if drawing_doc:
-                    _clear_dims(drawing_doc)
-            except Exception:
-                pass
-            _pending['fc'].clear()
-            return
-        assignments = _pending['fc'].pop('assignments', [])
-        dims_list   = _pending['fc'].pop('dims_list',   [])
-        views       = _pending['fc'].pop('views',       [])
+        # Dims are placed individually and state is saved; nothing to undo on cancel.
         _pending['fc'].clear()
-
-        design      = find_open_design()
-        drawing_doc = find_open_drawing()
-        if not design or not drawing_doc:
-            ui.messageBox('Dim Checklist: no open design or drawing document.')
-            return
-
-        _clear_dims(drawing_doc)
-        sheet  = drawing_doc.drawing.activeSheet
-        placed = []
-        errors = []
-        slots  = {}   # (view_idx, role) → next slot index for stagger
-
-        for dim, view_idx in zip(dims_list, assignments):
-            if view_idx is None or view_idx >= len(views):
-                continue
-            vi = views[view_idx]
-            try:
-                if dim['type'] == 'linear':
-                    orient = dim.get('orient') or 'H'
-                    key    = (view_idx, orient)
-                    slot   = slots.get(key, 0)
-                    slots[key] = slot + 1
-                    if _place_linear_dim(sheet, vi, dim['value'], orient=orient, slot=slot):
-                        placed.append(f"{dim['label']}: {dim['params_str']} → {vi['label']}")
-                    else:
-                        errors.append(f"{dim['id']} {dim['value']:.2f}mm: no matching geometry in {vi['label']}")
-                elif dim['type'] == 'radial':
-                    if _place_radial_dim(sheet, vi, dim['value']):
-                        placed.append(f"{dim['label']}: {dim['params_str']} → {vi['label']}")
-                    else:
-                        errors.append(f"R{dim['value']:.2f}: no matching arc in {vi['label']}")
-                elif dim['type'] == 'diameter':
-                    if _place_diameter_dim(sheet, vi, dim['value']):
-                        placed.append(f"{dim['label']}: {dim['params_str']} → {vi['label']}")
-                    else:
-                        errors.append(f"Ø{dim['value']:.2f}: no matching arc in {vi['label']}")
-            except Exception as e:
-                errors.append(f"{dim['label']}: {e}")
-
-        msg = ('Placed:\n  ' + '\n  '.join(placed)) if placed else 'Nothing placed.'
-        if errors:
-            msg += '\n\nIssues:\n  ' + '\n  '.join(errors)
-        ui.messageBox(msg)
 
 
 # ─── DWG Probe ───────────────────────────────────────────────────────────────
