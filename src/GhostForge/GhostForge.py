@@ -409,21 +409,25 @@ def _search_linear_pts(view, target_paper_mm, orient='H', tol=0.005):
         except Exception:
             pass
 
-    best_pti, best_ptj = None, None
-    best_err = tol  # only accept pairs within tol of target
+    best_pti, best_ptj, best_err = None, None, tol
 
-    for i in range(len(pts)):
-        xi, yi, pti = pts[i]
-        for j in range(i + 1, len(pts)):
-            xj, yj, ptj = pts[j]
-            dx, dy = abs(xj - xi), abs(yj - yi)
-            main = dx if orient == 'H' else dy
-            perp = dy if orient == 'H' else dx
-            err  = abs(main - target_paper_mm)
-            if err < best_err and perp <= 2.0:
-                best_err  = err
-                best_pti  = pti
-                best_ptj  = ptj
+    # Two-pass: tight perp first (avoids false matches), then slightly looser.
+    # _verify_placed_dim acts as the safety net for any false positives.
+    for perp_limit in (2.0, 3.0):
+        for i in range(len(pts)):
+            xi, yi, pti = pts[i]
+            for j in range(i + 1, len(pts)):
+                xj, yj, ptj = pts[j]
+                dx, dy = abs(xj - xi), abs(yj - yi)
+                main = dx if orient == 'H' else dy
+                perp = dy if orient == 'H' else dx
+                err  = abs(main - target_paper_mm)
+                if err < best_err and perp <= perp_limit:
+                    best_err = err
+                    best_pti = pti
+                    best_ptj = ptj
+        if best_pti is not None:
+            break  # found in this pass; skip looser pass
 
     return best_pti, best_ptj
 
@@ -494,18 +498,18 @@ def _arc_scale(view_info):
     return view_info.get('scale', 1.0) or 1.0
 
 
-def _arc_info(c):
+def _arc_info(c, scale=1.0):
     """Return (cx, cy, r) all in paper-space mm for a ViewCurve arc/circle, or None.
 
-    Approach 1: centerPoint + startPoint — startPoint is always a point ON the arc,
-                so distance(center, start) = radius. midPoint is NOT used because it
-                does not exist on DrawingViewCurve in all Fusion builds.
-    Approach 2: centerPoint + endPoint  — same idea, alternate endpoint.
-    Approach 3: circumscribed circle of startPoint / endPoint and their midpoint
-                computed from both (only for open arcs where centerPoint is absent).
-    Note: c.geometry returns model-space cm, not paper-space mm — never used here.
+    Approach 1: centerPoint + startPoint — distance(center, start) = radius (paper mm).
+    Approach 2: centerPoint + endPoint  — fallback when startPoint throws (closed circle).
+    Approach 3: centerPoint + geometry.radius — for Circle type=2 curves where
+                start/end are inaccessible. c.geometry.radius is model-space cm;
+                multiply by 10*scale to reach paper-space mm.
+    Note: approach 3 was previously a chord-midpoint circumscribed circle formula
+          which was mathematically wrong (chord midpoint ≠ arc midpoint).
     """
-    # Approach 1: center + start (most reliable; works whenever centerPoint exists)
+    # Approach 1: center + start (works for Arc type=1 and some Circle type=2)
     try:
         cp = c.centerPoint.coordinate
         sp = c.startPoint.coordinate
@@ -515,7 +519,7 @@ def _arc_info(c):
     except Exception:
         pass
 
-    # Approach 2: center + end (same idea, different endpoint)
+    # Approach 2: center + end (closed circles often have no distinct startPoint)
     try:
         cp = c.centerPoint.coordinate
         ep = c.endPoint.coordinate
@@ -525,24 +529,16 @@ def _arc_info(c):
     except Exception:
         pass
 
-    # Approach 3: circumscribed circle of start / chord-midpoint / end
-    # (for curves that have startPoint/endPoint but no accessible centerPoint)
+    # Approach 3: model-space geometry radius for complete circles (Circle type=2)
+    # where start/end are not accessible. c.geometry is a Circle3D or Arc3D in
+    # model-space (cm); .radius gives the model-space radius. Converting:
+    #   paper_mm = model_cm * 10.0 * scale
     try:
-        ax, ay = c.startPoint.coordinate.x, c.startPoint.coordinate.y
-        ex, ey = c.endPoint.coordinate.x,   c.endPoint.coordinate.y
-        # Use the geometric midpoint of the chord as a third point approximation.
-        # This is only exact for semicircles; for shallow arcs a small error is
-        # introduced but the 0.1 mm best-match tolerance absorbs it.
-        bx, by = (ax + ex) / 2, (ay + ey) / 2
-        # Perpendicular bisector intersection gives circle center
-        # (degenerate when ax≈ex and ay≈ey, i.e. nearly closed arc — skip then)
-        d = 2 * (ax*(by-ey) + bx*(ey-ay) + ex*(ay-by))
-        if abs(d) > 1e-9:
-            ux = ((ax*ax+ay*ay)*(by-ey) + (bx*bx+by*by)*(ey-ay) + (ex*ex+ey*ey)*(ay-by)) / d
-            uy = ((ax*ax+ay*ay)*(ex-bx) + (bx*bx+by*by)*(ax-ex) + (ex*ex+ey*ey)*(bx-ax)) / d
-            r  = math.hypot(ax-ux, ay-uy)
-            if r > 0.01:
-                return ux, uy, r
+        cp   = c.centerPoint.coordinate   # paper-space center (mm) — must exist
+        r_cm = c.geometry.radius          # model-space radius (cm)
+        r    = r_cm * 10.0 * scale        # → paper-space mm
+        if r > 0.01:
+            return cp.x, cp.y, r
     except Exception:
         pass
 
@@ -560,7 +556,7 @@ def _place_radial_dim(sheet, view_info, target_r_mm):
     best_err, best_c, best_cx, best_cy, best_r = 0.1, None, None, None, None
     for ci in range(v.viewCurves.count):
         c   = v.viewCurves.item(ci)
-        inf = _arc_info(c)
+        inf = _arc_info(c, scale)
         if inf is None:
             continue
         cx, cy, r = inf
@@ -592,7 +588,7 @@ def _place_diameter_dim(sheet, view_info, target_d_mm):
     best_err, best_c, best_cx, best_cy, best_r = 0.1, None, None, None, None
     for ci in range(v.viewCurves.count):
         c   = v.viewCurves.item(ci)
-        inf = _arc_info(c)
+        inf = _arc_info(c, scale)
         if inf is None:
             continue
         cx, cy, r = inf
@@ -1340,6 +1336,65 @@ def _place_dims_from_placements(sheet, dims_list, placements, views):
     return results
 
 
+def _write_place_debug(dim, view_info, sheet):
+    """Write a diagnostic entry to Desktop/ghostforge_place_debug.txt when placement fails.
+
+    Logs how many points were found in the view, the target distance, and the
+    closest matching pair (so we can see if the issue is perp or tolerance).
+    """
+    try:
+        v      = view_info['view']
+        scale  = view_info.get('scale', 1.0) or 1.0
+        orient = dim.get('orient') or 'H'
+        target = dim['value'] * scale
+        lines  = [
+            f'=== PLACE FAIL: {dim["label"]}  value={dim["value"]:.3f}mm  '
+            f'type={dim["type"]}  orient={orient} ===',
+            f'  view: {view_info["label"]}  type={v.type}  scale={scale:.4g}  '
+            f'target={target:.3f}mm  curves={v.viewCurves.count}',
+        ]
+        pts = []
+        for ci in range(v.viewCurves.count):
+            c = v.viewCurves.item(ci)
+            for pt in (c.startPoint, c.endPoint):
+                try:
+                    co = pt.coordinate
+                    pts.append((co.x, co.y))
+                except Exception:
+                    pass
+            try:
+                co = c.centerPoint.coordinate
+                pts.append((co.x, co.y))
+            except Exception:
+                pass
+        lines.append(f'  pts_collected={len(pts)}')
+        if pts:
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            lines.append(f'  pts_bbox: x={min(xs):.2f}..{max(xs):.2f} '
+                         f'y={min(ys):.2f}..{max(ys):.2f}')
+        best_err, best_perp = float('inf'), float('inf')
+        for i in range(len(pts)):
+            xi, yi = pts[i]
+            for j in range(i + 1, len(pts)):
+                xj, yj = pts[j]
+                dx, dy = abs(xj - xi), abs(yj - yi)
+                main = dx if orient == 'H' else dy
+                perp = dy if orient == 'H' else dx
+                err = abs(main - target)
+                if err < best_err:
+                    best_err, best_perp = err, perp
+        if best_err < float('inf'):
+            lines.append(f'  closest_pair: err={best_err:.4f}mm  perp={best_perp:.2f}mm'
+                         f'  (need err<0.005 AND perp<=3.0)')
+        else:
+            lines.append('  no point pairs (pts list empty)')
+        path = os.path.join(DESKTOP, 'ghostforge_place_debug.txt')
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n\n')
+    except Exception:
+        pass
+
+
 class FCCreatedHandler(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
         try:
@@ -1510,6 +1565,12 @@ class FCInputChangedHandler(adsk.core.InputChangedEventHandler):
                         if dim['type'] == 'linear':
                             new_obj = _place_linear_dim(sheet, vi, dim['value'],
                                                         orient=orient, slot=slot)
+                            if new_obj is None:
+                                # Try opposite orientation — sketch orient may not
+                                # match the paper-space direction in projected views.
+                                alt = 'V' if orient == 'H' else 'H'
+                                new_obj = _place_linear_dim(sheet, vi, dim['value'],
+                                                            orient=alt, slot=slot)
                         elif dim['type'] == 'radial':
                             new_obj = _place_radial_dim(sheet, vi, dim['value'])
                         elif dim['type'] == 'diameter':
@@ -1517,6 +1578,8 @@ class FCInputChangedHandler(adsk.core.InputChangedEventHandler):
                         # angular: no auto-placement; handled as "manual" below
                     except Exception:
                         new_obj = None
+                    if new_obj is None and v_idx is not None:
+                        _write_place_debug(dim, vi, sheet)
                     placed_objs[dim_id] = new_obj
 
             # Update only this dim's status cell and persist it
@@ -1652,6 +1715,79 @@ class DPDestroyHandler(adsk.core.CommandEventHandler):
         if not _pending['probe'].pop('ok', False):
             return
         results = []
+
+        # ── 0. View Curve Coordinate Dump — the key diagnostic for arc detection ──
+        _vc_path = os.path.join(DESKTOP, 'ghostforge_view_curves.txt')
+        try:
+            with open(_vc_path, 'w', encoding='utf-8') as _vf:
+                def _vw(s): _vf.write(s + '\n')
+                _vw('=== GhostForge View Curve Coordinates ===')
+                _vw('Each curve: [idx] ct=curveType sp=(x,y) ep=(x,y) ctr=(x,y) geom.r=cm')
+                _vw('ct: 0=Line 1=Arc 2=Circle 3=Ellipse 4=Spline 5=Polyline')
+                _vw('')
+                _dd = adsk.drawing.DrawingDocument.cast(app.activeDocument)
+                if _dd is None:
+                    _vw('No drawing document open.')
+                else:
+                    _sh = _dd.drawing.activeSheet
+                    for _vi in range(_sh.views.count):
+                        _v = _sh.views.item(_vi)
+                        _sc = 1.0
+                        try:
+                            _sc = float(_v.scale)
+                        except Exception:
+                            try:
+                                _sc = float(_v.scaleValue)
+                            except Exception:
+                                pass
+                        _vw(f'VIEW[{_vi}] type={_v.type} scale={_sc:.4g} '
+                            f'curves={_v.viewCurves.count}')
+                        _ctr_found = 0
+                        for _ci in range(_v.viewCurves.count):
+                            _c = _v.viewCurves.item(_ci)
+                            _row = [f'  [{_ci:3d}]']
+                            # curveType
+                            _ct = '?'
+                            for _a in ('curveType', 'type'):
+                                try:
+                                    _ct = str(getattr(_c, _a))
+                                    break
+                                except Exception:
+                                    pass
+                            _row.append(f'ct={_ct}')
+                            # startPoint
+                            try:
+                                _co = _c.startPoint.coordinate
+                                _row.append(f'sp=({_co.x:.3f},{_co.y:.3f})')
+                            except Exception:
+                                _row.append('sp=ERR')
+                            # endPoint
+                            try:
+                                _co = _c.endPoint.coordinate
+                                _row.append(f'ep=({_co.x:.3f},{_co.y:.3f})')
+                            except Exception:
+                                _row.append('ep=ERR')
+                            # centerPoint
+                            try:
+                                _co = _c.centerPoint.coordinate
+                                _row.append(f'ctr=({_co.x:.3f},{_co.y:.3f})')
+                                _ctr_found += 1
+                            except Exception:
+                                _row.append('ctr=ERR')
+                            # geometry.radius (model-space cm)
+                            try:
+                                _r = _c.geometry.radius
+                                _row.append(f'geom.r={_r:.5f}cm')
+                            except Exception:
+                                pass
+                            _vw(' '.join(_row))
+                        _vw(f'  → centerPoints accessible: {_ctr_found}/{_v.viewCurves.count}')
+                        _vw('')
+                _vw('=== DONE ===')
+            results.append(f'View curves -> Desktop/ghostforge_view_curves.txt')
+        except Exception as _e:
+            results.append(f'View curve dump ERR: {_e}')
+        results.append('')
 
         # ── 1. Python Drawing API probe — runs first, own file, never overwritten ──
         _api_path = os.path.join(DESKTOP, 'ghostforge_api_probe.txt')
